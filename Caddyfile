@@ -1,0 +1,29 @@
+# HTTPS для DocFlow. Сертификат Let's Encrypt Caddy получает и продлевает сам,
+# ничего настраивать не нужно — достаточно, чтобы домен из DOMAIN указывал на
+# этот сервер, а порты 80 и 443 были открыты.
+
+{
+	email {$ACME_EMAIL}
+}
+
+{$DOMAIN} {
+	encode gzip
+
+	# Загрузка сканов: файл до 25 МБ (MAX_UPLOAD_BYTES) плюс запас.
+	request_body {
+		max_size 32MB
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "same-origin"
+		-Server
+	}
+
+	reverse_proxy frontend:80 {
+		# Реальный адрес клиента нужен для ограничения попыток входа.
+		header_up X-Forwarded-For {remote_host}
+	}
+}

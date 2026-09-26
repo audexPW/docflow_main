@@ -1,0 +1,308 @@
+package recognize
+
+import (
+	"regexp"
+	"strings"
+
+	"docflow/internal/domain"
+)
+
+var (
+	reINN        = regexp.MustCompile(`(?i)ИНН[\s:]*?(\d{10}|\d{12})`)
+	reUNP        = regexp.MustCompile(`(?i)УНП[\s:№]*?(\d{9})`) // Беларусь: 9 цифр
+	reKPP        = regexp.MustCompile(`(?i)КПП[\s:]*?(\d{9})`)
+	reDateDotted = regexp.MustCompile(`\b(\d{2}\.\d{2}\.\d{4})\b`)
+	// Номер ищем сразу за названием документа: первый «№» в тексте сплошь и
+	// рядом принадлежит договору-основанию или УНП, а не самому документу.
+	reAnchoredNumber = regexp.MustCompile(`(?i)(счёт|счет|счёт-фактура|счет-фактура|эсчф|накладная|тн|ттн|акт|упд|товарный чек|договор|заказ)[^\n№N]{0,40}(?:№|N|No)[\s:]*([0-9A-Za-zА-Яа-я\-/]+)`)
+	reDocNumber      = regexp.MustCompile(`(?i)(?:№|N|No)[\s:]*([0-9A-Za-zА-Яа-я\-/]+)`)
+	reContractNumber = regexp.MustCompile(`(?i)(?:договор|контракт|основание|соглашени)\w*[^\n№N]{0,30}(?:№|N|No)[\s:]*([0-9A-Za-zА-Яа-я\-/]+)`)
+	// Окно после якорного слова, в котором ищется сумма. Цифры в окне
+	// разрешены намеренно: строка итогов часто состоит из трёх колонок
+	// («31,49  6,29  37,78» — без НДС, НДС, с НДС), и нужная сумма стоит не
+	// первой. Какое из чисел итоговое, решает extractTotal.
+	reTotal = regexp.MustCompile(`(?i)(итого|всего к оплате|сумма к оплате|к оплате|всего)([^\n]{0,80})`)
+	reMoney = regexp.MustCompile(`\b(\d[\d\s]*[.,]\d{2})\b`)
+
+	// Стороны сделки. Контрагент — тот, кто выставил документ; организация —
+	// фирма заказчика, на которую документ оформлен. Различаются по подписи
+	// строки, потому что по одному только УНП понять, чей он, невозможно.
+	// \b в Go RE2 — граница ASCII-слова, а кириллица для неё «не буква»:
+	// с \b эти шаблоны не находили ни одной русской подписи. Поэтому граница
+	// задана явно — началом строки или небуквенным символом.
+	reCounterpartyLine = regexp.MustCompile(`(?im)^[^\n]{0,40}?(?:поставщик|продавец|исполнитель|грузоотправитель|подрядчик)[^\p{L}\n]{0,3}[:\-][ \t]*(.+)$`)
+	reOrganizationLine = regexp.MustCompile(`(?im)^[^\n]{0,40}?(?:покупатель|плательщик|заказчик|грузополучатель)[^\p{L}\n]{0,3}[:\-][ \t]*(.+)$`)
+	reTaxLabel         = regexp.MustCompile(`(?i)(УНП|ИНН|УНН)`)
+	rePartyTail        = regexp.MustCompile(`(?i)(адрес|р/с|расч|тел\.|тел\s|банк|факс|e-mail|почтовый)`)
+
+	reVATAmount = regexp.MustCompile(`(?i)(?:в\s*т\.?\s*ч\.?\s*ндс|в\s+том\s+числе\s+ндс|сумма\s+ндс|ндс\s+итого|итого\s+ндс)\s*(?:\d{1,2}\s*%)?\s*[:\-]?\s*([\d\s]+[.,]\d{2})`)
+	reCurrCode  = regexp.MustCompile(`\b(BYN|RUB|RUR|USD|EUR)\b`)
+	// \w в Go RE2 — только ASCII, поэтому кириллические хвосты слов задаются явно.
+	reCurrWord = regexp.MustCompile(`(?i)(бел\.?\s*руб|белорусск[а-яёА-ЯЁ]*\s+рубл|росс?ийск[а-яёА-ЯЁ]*\s+рубл|доллар[а-яёА-ЯЁ]*\s+США|евро)`)
+)
+
+// extractByRules достаёт частые реквизиты. Значения этого прохода имеют source
+// "rule"; модель затем может их дополнить или перекрыть более точными.
+func extractByRules(ocrText string) map[string]domain.Field {
+	fields := make(map[string]domain.Field)
+
+	// Стороны сделки разбираем первыми: от них зависит, чей налоговый
+	// идентификатор считать идентификатором контрагента.
+	cpName, cpTax := party(ocrText, reCounterpartyLine)
+	orgName, orgTax := party(ocrText, reOrganizationLine)
+
+	if cpName != "" {
+		fields["counterparty"] = ruleField(cpName)
+	}
+	if orgName != "" {
+		fields["organization"] = ruleField(orgName)
+	}
+	if orgTax != "" {
+		fields["organization_unp"] = ruleField(orgTax)
+	}
+
+	if unp := pickTaxID(ocrText, reUNP, cpTax, orgTax); unp != "" {
+		fields["unp"] = ruleField(unp)
+	}
+	if inn := pickTaxID(ocrText, reINN, cpTax, orgTax); inn != "" {
+		fields["inn"] = ruleField(inn)
+	}
+	if m := reKPP.FindStringSubmatch(ocrText); m != nil {
+		fields["kpp"] = ruleField(m[1])
+	}
+	if num, conf := extractDocNumber(ocrText); num != "" {
+		fields["number"] = domain.Field{Value: num, Confidence: conf, Source: "rule"}
+	}
+	if m := reDateDotted.FindStringSubmatch(ocrText); m != nil {
+		fields["date"] = ruleField(m[1])
+	}
+	if amount, conf := extractTotal(ocrText); amount != "" {
+		fields["total"] = domain.Field{Value: amount, Confidence: conf, Source: "rule"}
+	}
+	if m := reVATAmount.FindStringSubmatch(ocrText); m != nil {
+		fields["vat_amount"] = ruleField(normalizeMoney(m[1]))
+	}
+	if cur := extractCurrency(ocrText); cur != "" {
+		fields["currency"] = ruleField(cur)
+	}
+
+	return fields
+}
+
+// party достаёт наименование стороны и её налоговый номер из строки вида
+// «Поставщик: ООО "Ромашка", УНП 191234567».
+func party(text string, re *regexp.Regexp) (name, taxID string) {
+	m := re.FindStringSubmatch(text)
+	if m == nil {
+		return "", ""
+	}
+	tail := strings.TrimSpace(m[1])
+
+	if t := reUNP.FindStringSubmatch(tail); t != nil {
+		taxID = t[1]
+	} else if t := reINN.FindStringSubmatch(tail); t != nil {
+		taxID = t[1]
+	}
+
+	// Наименование — до налогового номера или до адреса/реквизитов банка.
+	if loc := reTaxLabel.FindStringIndex(tail); loc != nil {
+		tail = tail[:loc[0]]
+	}
+	if loc := rePartyTail.FindStringIndex(tail); loc != nil {
+		tail = tail[:loc[0]]
+	}
+	name = strings.TrimSpace(strings.Trim(strings.TrimSpace(tail), ",;:-"))
+	if len([]rune(name)) < 3 {
+		name = ""
+	}
+	return name, taxID
+}
+
+// pickTaxID выбирает налоговый номер контрагента. Если строка поставщика
+// подписана — берём номер оттуда. Иначе берём первый номер в тексте, но
+// пропускаем тот, что уже опознан как номер собственной организации: иначе в
+// 1С контрагентом станет сам заказчик.
+func pickTaxID(text string, re *regexp.Regexp, cpTax, orgTax string) string {
+	if cpTax != "" && matchesShape(re, cpTax) {
+		return cpTax
+	}
+	for _, m := range re.FindAllStringSubmatch(text, -1) {
+		if orgTax != "" && m[1] == orgTax {
+			continue
+		}
+		return m[1]
+	}
+	return ""
+}
+
+// matchesShape проверяет, что номер подходит под формат этой регулярки
+// (УНП — 9 цифр, ИНН — 10 или 12): один и тот же номер не может быть обоими.
+func matchesShape(re *regexp.Regexp, id string) bool {
+	switch re {
+	case reUNP:
+		return len(id) == 9
+	case reINN:
+		return len(id) == 10 || len(id) == 12
+	}
+	return false
+}
+
+func extractCurrency(text string) string {
+	if m := reCurrCode.FindStringSubmatch(text); m != nil {
+		if strings.EqualFold(m[1], "RUR") {
+			return "RUB"
+		}
+		return strings.ToUpper(m[1])
+	}
+	m := reCurrWord.FindStringSubmatch(text)
+	if m == nil {
+		return ""
+	}
+	w := strings.ToLower(m[1])
+	switch {
+	case strings.HasPrefix(w, "бел"):
+		return "BYN"
+	case strings.HasPrefix(w, "рос"), strings.HasPrefix(w, "росс"):
+		return "RUB"
+	case strings.HasPrefix(w, "доллар"):
+		return "USD"
+	case strings.HasPrefix(w, "евро"):
+		return "EUR"
+	}
+	return ""
+}
+
+// extractDocNumber возвращает номер документа и уверенность в нём.
+// Номер, найденный сразу после названия документа, надёжен. Номер, взятый
+// «первым попавшимся №», — догадка, и она помечается низкой уверенностью,
+// чтобы оператор увидел поле как требующее проверки, а не как факт.
+func extractDocNumber(text string) (string, float64) {
+	contract := contractNumber(text)
+
+	// Проходим все привязанные к названию номера: если документ — не договор,
+	// номер договора-основания пропускаем.
+	var anchoredContract string
+	for _, m := range reAnchoredNumber.FindAllStringSubmatch(text, -1) {
+		num := strings.Trim(m[2], "-/")
+		if num == "" {
+			continue
+		}
+		if contract != "" && num == contract {
+			anchoredContract = num
+			continue
+		}
+		return num, ruleConfidence
+	}
+	// Единственный найденный номер — договорный: значит это и есть договор.
+	if anchoredContract != "" {
+		return anchoredContract, ruleConfidence
+	}
+
+	for _, m := range reDocNumber.FindAllStringSubmatch(text, -1) {
+		num := strings.Trim(m[1], "-/")
+		if num == "" || (contract != "" && num == contract) {
+			continue
+		}
+		return num, guessConfidence
+	}
+	return "", 0
+}
+
+// contractNumber возвращает номер договора-основания, если он в тексте есть.
+// Он часто напечатан выше номера самого документа и раньше подхватывался
+// вместо него.
+func contractNumber(text string) string {
+	if m := reContractNumber.FindStringSubmatch(text); m != nil {
+		return strings.Trim(m[1], "-/")
+	}
+	return ""
+}
+
+// extractTotal ищет итоговую сумму по якорным словам («итого», «всего к
+// оплате»). Если якоря нет, возвращается максимальная сумма в тексте — но это
+// именно догадка: в документе максимальной может оказаться сумма прописью,
+// лимит по договору или сумма прошлого периода. Такое значение отдаётся с
+// низкой уверенностью, и оператор увидит его как требующее проверки.
+func extractTotal(text string) (string, float64) {
+	for _, m := range reTotal.FindAllStringSubmatch(text, -1) {
+		window := m[2]
+		lowerWindow := strings.ToLower(window)
+
+		// Если ближайшее число после якоря сразу подписано как НДС —
+		// это не итоговая сумма, якорь пропускаем целиком.
+		if loc := reMoney.FindStringIndex(window); loc != nil {
+			pre := lowerWindow[:loc[0]]
+			if strings.Contains(pre, "ндс") || strings.Contains(pre, "налог") {
+				continue
+			}
+		}
+
+		// Строка вида «Итого: 31,49 6,29 37,78» — три колонки (сумма,
+		// НДС, сумма с НДС). Итоговая сумма к оплате всегда наибольшая
+		// из них, поэтому берём максимум, а не первое число.
+		var best string
+		var bestVal float64
+		for _, mv := range reMoney.FindAllString(window, -1) {
+			val := moneyToFloat(mv)
+			if val > bestVal {
+				bestVal = val
+				best = mv
+			}
+		}
+		if best != "" {
+			return normalizeMoney(best), ruleConfidence
+		}
+	}
+
+	var best string
+	var bestVal float64
+	for _, m := range reMoney.FindAllStringSubmatch(text, -1) {
+		val := moneyToFloat(m[1])
+		if val > bestVal {
+			bestVal = val
+			best = m[1]
+		}
+	}
+	if best == "" {
+		return "", 0
+	}
+	return normalizeMoney(best), guessConfidence
+}
+
+func normalizeMoney(s string) string {
+	if s == "" {
+		return ""
+	}
+	s = strings.ReplaceAll(s, " ", "")
+	s = strings.ReplaceAll(s, ",", ".")
+	return s
+}
+
+// moneyToFloat даёт грубую числовую оценку строки суммы. Точность не важна —
+// значение нужно только чтобы сравнить кандидатов и выбрать максимальный.
+func moneyToFloat(s string) float64 {
+	s = normalizeMoney(s)
+	var f float64
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c >= '0' && c <= '9' {
+			f = f*10 + float64(c-'0')
+		}
+	}
+	return f
+}
+
+// Уверенность значений, найденных правилами.
+//
+// ruleConfidence — значение стоит рядом со своим якорем («Итого: …», «Счёт
+// №…»), ошибиться сложно. guessConfidence — значение выведено эвристикой без
+// якоря; оно может быть верным, но проверять его обязательно, поэтому
+// интерфейс подсвечивает такие поля, а в 1С они уходят уже видимыми как
+// неточные.
+const (
+	ruleConfidence  = 0.7
+	guessConfidence = 0.3
+)
+
+func ruleField(v string) domain.Field {
+	return domain.Field{Value: strings.TrimSpace(v), Confidence: ruleConfidence, Source: "rule"}
+}

@@ -1,0 +1,9 @@
+# Surya зафиксирована на последней «лёгкой» линейке (detection+recognition,
+# без VLM). torch ставится CPU-сборкой в Dockerfile — здесь без него.
+surya-ocr==0.17.1
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+pillow>=10.2.0,<11.0.0
+requests
+transformers==4.57.3

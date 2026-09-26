@@ -1,0 +1,11 @@
+services:
+  docflow-backend:
+    volumes:
+      - /srv/docflow/onec_outbox:/var/lib/docflow/onec_outbox
+      - ./accounts.json:/etc/docflow/accounts.json:ro
+  frontend:
+    ports:
+      - "80:80"
+  surya-ocr:
+    volumes:
+      - ./models/datalab:/root/.cache/datalab

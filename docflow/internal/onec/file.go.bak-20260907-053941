@@ -1,0 +1,332 @@
+package onec
+
+import (
+	"context"
+	"encoding/xml"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+
+	"docflow/internal/config"
+	"docflow/internal/domain"
+	"docflow/internal/recognize"
+)
+
+type fileExporter struct {
+	dir string
+}
+
+func newFileExporter(cfg config.OneCConfig) (*fileExporter, error) {
+	if err := os.MkdirAll(cfg.FileDir, 0o750); err != nil {
+		return nil, err
+	}
+	return &fileExporter{dir: cfg.FileDir}, nil
+}
+
+func (e *fileExporter) Export(_ context.Context, p Payload) error {
+	doc := toEnterpriseData(p)
+	body, err := xml.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return err
+	}
+	body = append([]byte(xml.Header), body...)
+
+	// У каждого юрлица своя папка обмена: 1С заходит под компанией А и видит
+	// только документы А. Папки без компании (старые документы) продолжают
+	// ложиться в корень каталога обмена.
+	dir := e.dir
+	if folder := sanitizeFolder(p.CompanyFolder); folder != "" {
+		dir = filepath.Join(e.dir, folder)
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			return fmt.Errorf("company folder %q: %w", folder, err)
+		}
+	}
+
+	// Имя файла содержит SourceId — прямое соответствие между файлом в
+	// папке обмена и <SourceId> внутри него. Kind — суффикс, а не просто
+	// SourceId: один документ может выгрузиться дважды разными job'ами
+	// (partial, затем update), и это должны остаться два разных файла —
+	// иначе второй перезапишет на диске ещё не забранный 1С файл первого,
+	// а update без существующего в базе документа приёмник молча пропустит.
+	name := fmt.Sprintf("%s_%s.xml", p.DocumentID, p.Kind)
+	tmp := filepath.Join(dir, "."+name)
+	final := filepath.Join(dir, name)
+
+	if err := os.WriteFile(tmp, body, 0o640); err != nil {
+		return err
+	}
+	// атомарная публикация: 1С не увидит частично записанный файл
+	return os.Rename(tmp, final)
+}
+
+// sanitizeFolder не даёт имени папки увести запись за пределы каталога обмена:
+// имя приходит из базы, но заводит его человек руками.
+func sanitizeFolder(name string) string {
+	name = strings.TrimSpace(name)
+	name = strings.ReplaceAll(name, "\\", "/")
+	if i := strings.LastIndexByte(name, '/'); i >= 0 {
+		name = name[i+1:]
+	}
+	if name == "." || name == ".." {
+		return ""
+	}
+	return name
+}
+
+// Упрощённое представление в духе EnterpriseData: 1С-разработчик мапит эти поля
+// на реквизиты своей конфигурации. Структура намеренно плоская и стабильная.
+type enterpriseData struct {
+	XMLName xml.Name `xml:"Message"`
+	Format  string   `xml:"format,attr"`
+	Body    edBody   `xml:"Body"`
+}
+
+type edBody struct {
+	Document edDocument `xml:"Document"`
+}
+
+type edDocument struct {
+	SourceID     string    `xml:"SourceId"`
+	Kind         string    `xml:"kind,attr,omitempty"`
+	Incomplete   bool      `xml:"incomplete,attr,omitempty"`
+	Type         string    `xml:"Type"`
+	TypeTitle    string    `xml:"TypeTitle,omitempty"`
+	Target       *edTarget `xml:"Target,omitempty"`
+	Number       string    `xml:"Number,omitempty"`
+	Date         string    `xml:"Date,omitempty"`
+	Total        string    `xml:"Total,omitempty"`
+	VATAmount    string    `xml:"VATAmount,omitempty"`
+	Currency     string    `xml:"Currency,omitempty"`
+	Organization string    `xml:"Organization,omitempty"`
+	OrgTaxID     string    `xml:"OrganizationUNP,omitempty"`
+	FileName     string    `xml:"FileName,omitempty"`
+	// Accounting — готовая проводка: счета подобраны по содержимому документа
+	// и плану счетов заказчика. Пустые значения означают «не определено» —
+	// приёмник в этом случае оставляет выбор бухгалтеру, как и раньше.
+	Accounting   *edAccounting `xml:"Accounting,omitempty"`
+	Company      *edCompany    `xml:"Company,omitempty"`
+	Counterparty edCounter     `xml:"Counterparty"`
+	// Table — табличная часть со структурой: колонки и ячейки. Lines оставлены
+	// для совместимости с уже написанным приёмником, но разбирать теперь
+	// правильнее Table: там видно, какая ячейка какой колонке принадлежит.
+	Table   *edTable  `xml:"Table,omitempty"`
+	Lines   []edLine  `xml:"Lines>Line"`
+	Missing []string  `xml:"MissingFields>Field,omitempty"`
+	Extra   []edField `xml:"AdditionalFields>Field"`
+}
+
+// edAccounting — счета учёта документа целиком. По строкам счёт может
+// отличаться (канцтовары и аренда в одном акте), поэтому у каждой строки есть
+// свой атрибут account.
+type edAccounting struct {
+	Debit       string `xml:"debit,attr,omitempty"`
+	DebitTitle  string `xml:"debitTitle,attr,omitempty"`
+	Credit      string `xml:"credit,attr,omitempty"`
+	CreditTitle string `xml:"creditTitle,attr,omitempty"`
+	VAT         string `xml:"vat,attr,omitempty"`
+}
+
+// edCompany — юрлицо, от имени которого пришёл документ.
+type edCompany struct {
+	Name   string `xml:"Name,omitempty"`
+	UNP    string `xml:"UNP,omitempty"`
+	Folder string `xml:"Folder,omitempty"`
+}
+
+// edTable — таблица как таблица: сначала объявлены колонки с их назначением,
+// потом строки из ячеек со ссылкой на колонку. Приёмнику не нужно угадывать,
+// где количество, а где сумма.
+type edTable struct {
+	Source    string     `xml:"source,attr,omitempty"`
+	RowCount  int        `xml:"rows,attr"`
+	Columns   []edColumn `xml:"Columns>Column"`
+	Rows      []edRow    `xml:"Rows>Row"`
+	TotalsRow *edRow     `xml:"TotalsRow,omitempty"`
+}
+
+type edColumn struct {
+	Index int    `xml:"index,attr"`
+	Role  string `xml:"role,attr,omitempty"`
+	Title string `xml:",chardata"`
+}
+
+type edRow struct {
+	Index int      `xml:"index,attr,omitempty"`
+	Cells []edCell `xml:"Cell"`
+}
+
+type edCell struct {
+	Column int    `xml:"column,attr"`
+	Role   string `xml:"role,attr,omitempty"`
+	Value  string `xml:",chardata"`
+}
+
+// edTarget — объект метаданных 1С, в который приёмник должен положить документ.
+// Согласовывается один раз в doctypes.json на стороне DocFlow, чтобы приёмник не
+// угадывал вид документа по коду типа.
+type edTarget struct {
+	Object string `xml:"object,attr"`
+	Kind   string `xml:"kind,attr,omitempty"`
+}
+
+type edCounter struct {
+	Name string `xml:"Name,omitempty"`
+	UNP  string `xml:"UNP,omitempty"` // Беларусь
+	INN  string `xml:"INN,omitempty"` // Россия
+	KPP  string `xml:"KPP,omitempty"`
+}
+
+// edLine — строка табличной части (номенклатура). 1С сопоставляет Name с
+// справочником Номенклатура (поиск/создание), остальное кладёт в строку таблицы.
+type edLine struct {
+	Account string `xml:"account,attr,omitempty"`
+	Name    string `xml:"Name"`
+	Qty     string `xml:"Qty,omitempty"`
+	Unit    string `xml:"Unit,omitempty"`
+	Price   string `xml:"Price,omitempty"`
+	Amount  string `xml:"Amount,omitempty"`
+	VAT     string `xml:"VAT,omitempty"`
+}
+
+type edField struct {
+	Name  string `xml:"name,attr"`
+	Value string `xml:",chardata"`
+}
+
+// buildTable переносит распознанную таблицу в XML без потери структуры.
+func buildTable(t *domain.Table) *edTable {
+	if t == nil || len(t.Rows) == 0 {
+		return nil
+	}
+	out := &edTable{Source: t.Source, RowCount: len(t.Rows)}
+	for _, c := range t.Columns {
+		out.Columns = append(out.Columns, edColumn{Index: c.Index, Role: c.Role, Title: c.Title})
+	}
+	for _, r := range t.Rows {
+		out.Rows = append(out.Rows, edRow{Index: r.Index, Cells: buildCells(r.Cells)})
+	}
+	if len(t.TotalsRow) > 0 {
+		out.TotalsRow = &edRow{Cells: buildCells(t.TotalsRow)}
+	}
+	return out
+}
+
+func buildCells(cells []domain.TableCell) []edCell {
+	out := make([]edCell, 0, len(cells))
+	for _, c := range cells {
+		out = append(out, edCell{Column: c.Column, Role: c.Role, Value: c.Value})
+	}
+	return out
+}
+
+// buildAccounting собирает блок проводки. Ничего не подобрано — блока нет:
+// пустой элемент в XML приёмник вынужден отличать от «не заполнено», а так
+// вопрос не возникает.
+func buildAccounting(p Payload) *edAccounting {
+	if p.AccountDebit == "" && p.AccountCredit == "" && p.AccountVAT == "" {
+		return nil
+	}
+	return &edAccounting{
+		Debit:       p.AccountDebit,
+		DebitTitle:  recognize.AccountTitle(p.AccountDebit),
+		Credit:      p.AccountCredit,
+		CreditTitle: recognize.AccountTitle(p.AccountCredit),
+		VAT:         p.AccountVAT,
+	}
+}
+
+func buildCompany(p Payload) *edCompany {
+	if p.CompanyName == "" && p.CompanyUNP == "" && p.CompanyFolder == "" {
+		return nil
+	}
+	return &edCompany{Name: p.CompanyName, UNP: p.CompanyUNP, Folder: p.CompanyFolder}
+}
+
+func buildTarget(p Payload) *edTarget {
+	if p.OneCObject == "" {
+		return nil
+	}
+	return &edTarget{Object: p.OneCObject, Kind: p.OneCKind}
+}
+
+func toEnterpriseData(p Payload) enterpriseData {
+	// Поля, которые уже разложены по явным элементам, не дублируем в Additional.
+	known := map[string]bool{
+		"number": true, "date": true, "total": true, "currency": true,
+		"vat_amount": true, "unp": true, "inn": true, "kpp": true,
+		"counterparty": true, "organization": true, "organization_unp": true,
+		recognize.FieldAccountDebit: true, recognize.FieldAccountCredit: true,
+		recognize.FieldAccountVAT: true,
+	}
+	var extra []edField
+	for k, v := range p.Fields {
+		if known[k] || v == "" || !usefulExtra(k, v) {
+			continue
+		}
+		extra = append(extra, edField{Name: k, Value: v})
+	}
+	// Порядок полей в map случайный — сортируем, чтобы две выгрузки одного
+	// документа не отличались перестановкой строк.
+	sort.Slice(extra, func(i, j int) bool { return extra[i].Name < extra[j].Name })
+
+	lines := make([]edLine, 0, len(p.Lines))
+	for _, l := range p.Lines {
+		lines = append(lines, edLine{
+			Account: l.Account,
+			Name:    l.Name, Qty: l.Qty, Unit: l.Unit,
+			Price: l.Price, Amount: l.Amount, VAT: l.VAT,
+		})
+	}
+
+	return enterpriseData{
+		Format: "EnterpriseData/1.0",
+		Body: edBody{
+			Document: edDocument{
+				SourceID:     p.DocumentID,
+				Kind:         p.Kind,
+				Incomplete:   p.Incomplete,
+				Type:         p.DocType,
+				TypeTitle:    p.DocTypeTitle,
+				Target:       buildTarget(p),
+				Number:       p.Number,
+				Date:         p.Date,
+				Total:        p.Total,
+				VATAmount:    p.VATAmount,
+				Currency:     p.Currency,
+				Organization: p.Organization,
+				OrgTaxID:     p.OrgTaxID,
+				FileName:     p.FileName,
+				Accounting:   buildAccounting(p),
+				Company:      buildCompany(p),
+				Counterparty: edCounter{
+					Name: p.Counterpty,
+					UNP:  p.UNP,
+					INN:  p.INN,
+					KPP:  p.KPP,
+				},
+				Table:   buildTable(p.Table),
+				Lines:   lines,
+				Missing: p.Missing,
+				Extra:   extra,
+			},
+		},
+	}
+}
+
+// usefulExtra отсеивает мусор из дополнительных полей. Раньше сюда попадало
+// всё подряд, включая куски распознанного текста, — в XML это выглядело как
+// свалка строк, а приёмнику мешало отличить реквизит от обрывка страницы.
+func usefulExtra(key, value string) bool {
+	if strings.ContainsAny(key, " |\t\n") || len(key) > 40 {
+		return false
+	}
+	if strings.ContainsAny(value, "|\n") {
+		return false
+	}
+	if len([]rune(value)) > 200 {
+		return false
+	}
+	return true
+}

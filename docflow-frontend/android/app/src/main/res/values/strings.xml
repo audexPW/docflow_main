@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">ПартнерБухгалтер</string>
+    <string name="title_activity_main">ПартнерБухгалтер</string>
+    <string name="package_name">by.docflow.app</string>
+    <string name="custom_url_scheme">by.docflow.app</string>
+</resources>

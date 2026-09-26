@@ -1,0 +1,100 @@
+--- a/internal/recognize/columns.go
++++ b/internal/recognize/columns.go
+@@ -170,9 +170,6 @@
+ 	sorted := make([]token, len(toks))
+ 	copy(sorted, toks)
+ 	sort.SliceStable(sorted, func(i, j int) bool {
+-		if sorted[i].Y0 == sorted[j].Y0 {
+-			return sorted[i].X0 < sorted[j].X0
+-		}
+ 		return sorted[i].Y0 < sorted[j].Y0
+ 	})
+ 
+@@ -196,12 +193,47 @@
+ 	}
+ 	sort.SliceStable(rows, func(i, j int) bool { return rows[i].Top < rows[j].Top })
+ 	for i := range rows {
++		if rowBoxesDegenerate(rows[i]) {
++			// Боксы слов совпадают с боксом всей строки (движок отдаёт
++			// координаты строки, а не слова). Сортировка по X0 тогда
++			// перемешивает слова по шумовой разнице в 1-3 пикселя.
++			// Порядок выдачи OCR — уже порядок чтения, оставляем его.
++			continue
++		}
+ 		r := rows[i].Toks
+ 		sort.SliceStable(r, func(a, b int) bool { return r[a].X0 < r[b].X0 })
+ 	}
+ 	return rows
+ }
+ 
++// degenerateBoxShare — доля слов, чей бокс шире 60% всей строки, начиная с
++// которой координаты считаются строчными, а не пословными.
++const degenerateBoxShare = 0.6
++
++// rowBoxesDegenerate — у слов строки нет собственных координат: бокс каждого
++// слова примерно равен боксу всей строки.
++func rowBoxesDegenerate(r tokenRow) bool {
++	if len(r.Toks) < 3 {
++		return false
++	}
++	minX, maxX := math.Inf(1), math.Inf(-1)
++	for _, t := range r.Toks {
++		minX = math.Min(minX, t.X0)
++		maxX = math.Max(maxX, t.X1)
++	}
++	span := maxX - minX
++	if span <= 0 {
++		return true
++	}
++	wide := 0
++	for _, t := range r.Toks {
++		if (t.X1-t.X0)/span > degenerateBoxShare {
++			wide++
++		}
++	}
++	return wide*2 > len(r.Toks)
++}
++
+ // findTableBand находит шапку и границы полосы данных.
+ //
+ // Шапка ищется как окно из одной-трёх подряд идущих строк, в котором суммарно
+--- a/internal/recognize/extract.go
++++ b/internal/recognize/extract.go
+@@ -25,7 +25,11 @@
+ 	// («31,49  6,29  37,78» — без НДС, НДС, с НДС), и нужная сумма стоит не
+ 	// первой. Какое из чисел итоговое, решает extractTotal.
+ 	reTotal = regexp.MustCompile(`(?i)(итого|всего к оплате|сумма к оплате|к оплате|всего)([^\n]{0,80})`)
+-	reMoney = regexp.MustCompile(`\b(\d[\d\s]*[.,]\d{2})\b`)
++	// Пробел внутри числа — только разделитель разрядов («1 234,56»), но не
++	// перенос строки: `\s` склеивал год в конце одной строки с суммой в
++	// начале следующей («за август 2023\n29,62» → 202329.62) и такое число
++	// выигрывало у настоящего итога как максимальное.
++	reMoney = regexp.MustCompile(`\b(\d[\d \x{00A0}]*[.,]\d{2})\b`)
+ 
+ 	// Стороны сделки. Контрагент — тот, кто выставил документ; организация —
+ 	// фирма заказчика, на которую документ оформлен. Различаются по подписи
+@@ -313,6 +317,13 @@
+ 		if best != "" {
+ 			return normalizeMoney(best), ruleConfidence
+ 		}
++
++		// Цифрами итога рядом с якорем нет — на белорусских бланках он
++		// часто напечатан прописью: «Всего Сорок семь белорусских рублей
++		// 74 копейки». Значение в документе есть, просто буквами.
++		if v := ParseMoneyWords(window); v != "" {
++			return v, ruleConfidence
++		}
+ 	}
+ 
+ 	var best string
+--- a/internal/recognize/words.go
++++ b/internal/recognize/words.go
+@@ -55,7 +55,7 @@
+ // reVATWords — «в том числе НДС» с суммой прописью. Отдельно от reVATAmount:
+ // та ищет цифры и на словесной записи не срабатывает.
+ var reVATWords = regexp.MustCompile(
+-	`(?i)(?:в\s*т\.?\s*ч\.?\s*ндс|в\s+том\s+числе\s+ндс|в\s+т\.?\s*ч\.?\s+ндс)\s*[:\-]?\s*` +
++	`(?i)(?:в\s*т\.?\s*ч\.?\s*ндс|в\s+том\s+числе\s+ндс|в\s+т\.?\s*ч\.?\s+ндс|сумма\s+ндс)\s*[:\-]?\s*` +
+ 		`([а-яё]+(?:[\s-]+[а-яё]+){0,8}\s+рубл\S*\s*(?:\d{1,2}|[а-яё]+(?:\s+[а-яё]+)?)\s*коп\S*)`)
+ 
+ // parseRussianInt переводит числительное прописью в число.

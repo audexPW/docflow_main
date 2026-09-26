@@ -1,0 +1,179 @@
+package recognize
+
+import (
+	"testing"
+
+	"docflow/internal/domain"
+)
+
+const belarusInvoice = `
+Счёт на оплату № 145 от 12.03.2026
+
+Поставщик: ООО "Ромашка", УНП 191234567, адрес: г. Минск, ул. Ленина, 1
+Покупатель: ЧУП "Василёк", УНП 200111222
+
+Наименование  Кол-во  Ед.  Цена  Сумма
+Бумага офисная А4  10  шт  12,50  125,00
+
+Итого: 375,00
+В том числе НДС 20%: 62,50
+Всего к оплате: 375,00 бел. руб.
+`
+
+func TestExtractPartiesSeparately(t *testing.T) {
+	f := extractByRules(belarusInvoice)
+
+	if got := f["counterparty"].Value; got != `ООО "Ромашка"` {
+		t.Errorf("контрагент: %q", got)
+	}
+	if got := f["organization"].Value; got != `ЧУП "Василёк"` {
+		t.Errorf("организация: %q", got)
+	}
+}
+
+// Самая опасная ошибка: подставить в 1С УНП покупателя как УНП контрагента —
+// документ уйдёт на самого заказчика.
+func TestTaxIDGoesToTheRightParty(t *testing.T) {
+	f := extractByRules(belarusInvoice)
+
+	if got := f["unp"].Value; got != "191234567" {
+		t.Errorf("УНП контрагента должен быть поставщика, получено %q", got)
+	}
+	if got := f["organization_unp"].Value; got != "200111222" {
+		t.Errorf("УНП организации: %q", got)
+	}
+}
+
+func TestExtractVATAndCurrency(t *testing.T) {
+	f := extractByRules(belarusInvoice)
+
+	if got := f["vat_amount"].Value; got != "62.50" {
+		t.Errorf("сумма НДС: %q (не должна быть ставкой 20)", got)
+	}
+	if got := f["currency"].Value; got != "BYN" {
+		t.Errorf("валюта: %q", got)
+	}
+}
+
+// Без подписанных строк поведение прежнее: первый найденный УНП — контрагента.
+func TestFallsBackToFirstTaxIDWhenPartiesUnlabelled(t *testing.T) {
+	f := extractByRules("Акт № 7 от 01.02.2026\nУНП 191234567\nИтого 1200,00")
+
+	if got := f["unp"].Value; got != "191234567" {
+		t.Errorf("запасной путь сломан: %q", got)
+	}
+	if _, ok := f["organization"]; ok {
+		t.Error("организации в тексте нет, а поле появилось")
+	}
+}
+
+func TestCurrencyByCode(t *testing.T) {
+	for text, want := range map[string]string{
+		"Итого 100,00 BYN":              "BYN",
+		"Сумма 50,00 USD":               "USD",
+		"Всего 10,00 российских рублей": "RUB",
+		"Итого 20,00 евро":              "EUR",
+		"Итого 30,00":                   "",
+	} {
+		if got := extractCurrency(text); got != want {
+			t.Errorf("%q → %q, ожидалось %q", text, got, want)
+		}
+	}
+}
+
+// Новые поля необязательные: их отсутствие не должно задерживать документ.
+func TestNewFieldsAreNotRequired(t *testing.T) {
+	t.Cleanup(func() { SetLocale("ru") })
+	SetLocale("by")
+
+	for _, docType := range []string{"invoice", "waybill", "act", "schet_faktura", "upd"} {
+		for _, f := range RequiredFields(docType) {
+			switch f {
+			case "organization", "organization_unp", "vat_amount", "currency":
+				t.Errorf("%s: поле %q стало обязательным — это ломает авто-выгрузку", docType, f)
+			}
+		}
+	}
+}
+
+// Номер документа должен браться у самого документа, а не у договора-основания,
+// который часто напечатан выше.
+func TestDocNumberIsNotContractNumber(t *testing.T) {
+	f := extractByRules(`
+Договор № 77/2025 от 01.01.2025
+Счёт на оплату № 145 от 12.03.2026
+Итого: 375,00
+`)
+	if got := f["number"].Value; got != "145" {
+		t.Errorf("номер документа: %q (взят номер договора?)", got)
+	}
+	if f["number"].Confidence < MinTrustedConfidence {
+		t.Error("номер найден по якорю — уверенность должна быть высокой")
+	}
+}
+
+// Номер и дата договора-основания раньше не извлекались вовсе, из-за чего
+// 1С не получала «Основание» ни в каком виде.
+func TestContractRefIsExtracted(t *testing.T) {
+	f := extractByRules(`
+Договор № 77/2025 от 01.01.2025
+Счёт на оплату № 145 от 12.03.2026
+Итого: 375,00
+`)
+	if got := f["contract_number"].Value; got != "77/2025" {
+		t.Errorf("номер договора: %q", got)
+	}
+	if got := f["contract_date"].Value; got != "01.01.2025" {
+		t.Errorf("дата договора: %q (не должна совпадать с датой документа)", got)
+	}
+}
+
+// Сумма без якоря «итого» — догадка, и она обязана быть помечена как
+// недостоверная, иначе неверное значение уедет в 1С без проверки человеком.
+func TestGuessedTotalIsMarkedUntrusted(t *testing.T) {
+	// Якорных слов («итого», «к оплате») в тексте нет — сработает запасной
+	// вариант «максимальная сумма в тексте», и он подхватит лимит по договору.
+	f := extractByRules("Накладная № 5 от 01.02.2026\nЛимит по договору 900000,00\nСтоимость 1200,00")
+
+	total := f["total"]
+	if total.Value == "" {
+		t.Fatal("сумма не извлеклась вовсе")
+	}
+	if total.Confidence >= MinTrustedConfidence {
+		t.Errorf("догадка получила высокую уверенность (%.2f) — уедет в 1С без проверки", total.Confidence)
+	}
+}
+
+func TestAnchoredTotalIsTrusted(t *testing.T) {
+	f := extractByRules("Счёт № 5 от 01.02.2026\nИтого к оплате: 1200,00")
+	if f["total"].Confidence < MinTrustedConfidence {
+		t.Errorf("сумма по якорю должна быть достоверной, получено %.2f", f["total"].Confidence)
+	}
+}
+
+// Недостоверное значение приравнивается к отсутствующему: документ уйдёт
+// частичной выгрузкой, а сотрудник подтвердит сумму руками.
+func TestUntrustedFieldCountsAsMissing(t *testing.T) {
+	t.Cleanup(func() { SetLocale("ru") })
+	SetLocale("by")
+
+	rec := domain.Recognition{
+		DocType: "invoice",
+		Fields: map[string]domain.Field{
+			"number": {Value: "145", Confidence: 0.7},
+			"date":   {Value: "12.03.2026", Confidence: 0.7},
+			"unp":    {Value: "191234567", Confidence: 0.7},
+			"total":  {Value: "999.00", Confidence: guessConfidence},
+		},
+	}
+	missing := MissingRequired(rec)
+	if len(missing) != 1 || missing[0] != "total" {
+		t.Errorf("ожидалось, что догадка попадёт в недостающие, получено %v", missing)
+	}
+
+	// Ручной ввод снимает вопрос независимо от уверенности.
+	rec.Fields["total"] = domain.Field{Value: "999.00", Confidence: 1, Source: "manual"}
+	if got := MissingRequired(rec); len(got) != 0 {
+		t.Errorf("после ручного ввода поле не должно считаться недостающим: %v", got)
+	}
+}

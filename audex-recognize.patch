@@ -1,0 +1,4230 @@
+diff --git a/docflow/internal/recognize/columns.go b/docflow/internal/recognize/columns.go
+index 2f7a600..4840556 100644
+--- a/docflow/internal/recognize/columns.go
++++ b/docflow/internal/recognize/columns.go
+@@ -4,6 +4,7 @@ import (
+ 	"math"
+ 	"regexp"
+ 	"sort"
++	"strconv"
+ 	"strings"
+ 
+ 	"docflow/internal/domain"
+@@ -79,6 +80,186 @@ type tokenRow struct {
+ // TableFromWords собирает табличную часть из слов с координатами.
+ // Возвращает nil, если полосу таблицы на странице найти не удалось — тогда
+ // работают прежние пути разбора.
++// ── строка итога, не опознанная по слову ────────────────────────
++//
++// Распознавание уродует слово «ИТОГО» («ОТОТИ», «ИТ0ГО», «MTOFO»), и строка
++// итога уезжает в позиции. Внешне таблица выглядит разобранной, а сумма
++// позиций оказывается ровно вдвое больше настоящей (IMG_0141: 95,48 вместо
++// 47,74) — в 1С уйдёт удвоенный документ.
++//
++// Слово тут ненадёжно, а арифметика надёжна: строка, значения которой по
++// нескольким колонкам равны суммам предыдущих строк, и есть итог, как бы её
++// ни распознали.
++
++func cellNumber(s string) (float64, bool) {
++	s = strings.TrimSpace(s)
++	if s == "" {
++		return 0, false
++	}
++	// пробелы-разделители разрядов бывают обычные, неразрывные и узкие
++	s = strings.NewReplacer(" ", "", "\u00a0", "", "\u202f", "", "\u2009", "", ",", ".").Replace(s)
++	if !reSimpleNumber.MatchString(s) {
++		return 0, false
++	}
++	v, err := strconv.ParseFloat(s, 64)
++	if err != nil {
++		return 0, false
++	}
++	return v, true
++}
++
++var reSimpleNumber = regexp.MustCompile(`^-?\d+(\.\d+)?$`)
++
++// takeGarbledTotalsRow — если ПОСЛЕДНЯЯ строка таблицы на деле является строкой
++// итога, забрать её из позиций в Totals.
++//
++// Зачем: распознавание уродует слово «ИТОГО» («ОТОТИ», «ИТ0ГО»), строка итога
++// остаётся в позициях, и сумма позиций оказывается вдвое больше настоящей —
++// в 1С уходит удвоенный документ.
++//
++// Почему так осторожно:
++//   - Проверяется ТОЛЬКО последняя строка. Итог печатается в конце таблицы, а
++//     обычная позиция в середине, случайно равная сумме предыдущих, раньше
++//     молча выбрасывалась.
++//   - Считаются ТОЛЬКО денежные графы. Графа «№ п/п» давала бесплатное
++//     совпадение на третьей строке (3 = 1 + 2), а графа количества — на
++//     «2 = 1 + 1», и порог «две графы» фактически равнялся одной.
++//   - Графы НДС и «всего» — линейные функции базовой суммы: если сошлась база,
++//     они сойдутся всегда. Поэтому нужна не просто пара совпадений, а
++//     совпадение по графе с ролью amount (базовая сумма) плюс ещё одна.
++//   - Данные не пропадают: если Totals уже заполнен, строка остаётся позицией.
++func takeGarbledTotalsRow(ft *domain.FreeTable) bool {
++	if len(ft.Rows) < 3 {
++		return false
++	}
++	// Totals считается занятым, только если там есть ЧИСЛА. Часто туда попадает
++	// строка «Всего … сорок семь белорусских рублей 74 копейки» — сумма прописью
++	// без единой цифры, а настоящий числовой итог остаётся в позициях.
++	//
++	// Занятый Totals больше не повод выйти: при «ИТ0ГО … 36,78» в
++	// таблице и «Всего к оплате с НДС: 36,78» ниже изуродованная строка оставалась
++	// позицией, и документ удваивался. Теперь её забираем, если её суммы
++	// совпадают с уже найденным итогом; не совпадают — строка остаётся позицией.
++	occupied := rowHasMoney(ft.Totals)
++	last := ft.Rows[len(ft.Rows)-1]
++	prev := ft.Rows[:len(ft.Rows)-1]
++
++	// У строки итога наименования нет: там либо пусто, либо огрызок слова
++	// «ИТОГО», изуродованный распознаванием («ОТОТИ», «ИТ0ГО»). Если в графе
++	// наименования стоит название услуги или товара — это ПОЗИЦИЯ, и сумма,
++	// случайно совпавшая с предыдущими, ничего не доказывает: графы НДС и
++	// «всего» линейны от базы и совпадают все разом.
++	if rowHasRealName(ft.Roles, last) {
++		return false
++	}
++
++	baseHit, hits := false, 0
++	for c := range last {
++		if !isMoneyColumn(ft.Roles, c) {
++			continue
++		}
++		// роль не определена — судим по содержимому: графы № и количества
++		// складываются «бесплатно» (3 = 1 + 2), а деньги пишутся с копейками
++		if roleUnknown(ft.Roles, c) && !reMoneyWritten.MatchString(strings.TrimSpace(last[c])) {
++			continue
++		}
++		v, ok := cellNumber(last[c])
++		if !ok || v == 0 {
++			continue
++		}
++		sum, cnt := 0.0, 0
++		for _, r := range prev {
++			if c >= len(r) {
++				continue
++			}
++			if pv, ok := cellNumber(r[c]); ok {
++				sum += pv
++				cnt++
++			}
++		}
++		// сумма должна складываться почти из всех предыдущих строк, а не из
++		// случайного подмножества. Одну строку прощаем: в начале таблицы часто
++		// стоит обломок шапки без чисел.
++		if cnt < 2 || cnt < len(prev)-1 {
++			continue
++		}
++		// допуск — копейки округления, а не доля суммы: на крупных документах
++		// относительный допуск превращается в тысячи рублей
++		if math.Abs(sum-v) <= 0.02+0.01*float64(len(prev)) {
++			hits++
++			if roleAt(ft.Roles, c) == "amount" {
++				baseHit = true
++			}
++		}
++	}
++	// роли не определены — тогда одного совпадения мало, требуем два
++	if (baseHit && hits >= 2) || (!hasAmountRole(ft.Roles) && hits >= 2) {
++		// прописную строку не теряем: она остаётся, если числовой итог короче
++		if rowHasMoney(last) && (!occupied || sharesMoney(ft.Totals, last)) {
++			ft.Totals = last
++			ft.Rows = prev
++			return true
++		}
++	}
++	return false
++}
++
++// rowHasMoney — есть ли в строке денежная сумма. Судим по НАПИСАНИЮ, а не по
++// значению: «60,00» после разбора становится целым числом 60 и по значению
++// неотличимо от ставки НДС. Деньги в этих документах всегда пишутся с копейками.
++// За копейками не может идти ещё точка или цифра: «14.09.2026» — дата, а не 14,09
++// (дата в строке «Всего по счёту от …» делала Totals «занятым»).
++var reMoneyWritten = regexp.MustCompile(`\d+[.,]\d{2}([^\d.,]|$)`)
++
++func rowHasMoney(cells []string) bool {
++	for _, c := range cells {
++		if reMoneyWritten.MatchString(strings.TrimSpace(c)) {
++			return true
++		}
++		// суммы от сотни печатают и без копеек
++		if v, ok := cellNumber(c); ok && v >= 100 {
++			return true
++		}
++	}
++	return false
++}
++
++func roleAt(roles []string, c int) string {
++	if c < len(roles) {
++		return roles[c]
++	}
++	return ""
++}
++
++func hasAmountRole(roles []string) bool {
++	for _, r := range roles {
++		if r == "amount" {
++			return true
++		}
++	}
++	return false
++}
++
++// isMoneyColumn — графа, где суммирование по строкам осмысленно. Номер строки,
++// количество, единица измерения и ставка НДС сюда не входят: они складываются
++// «бесплатно» и дают ложные совпадения. Цена за единицу тоже не суммируется.
++func isMoneyColumn(roles []string, c int) bool {
++	switch roleAt(roles, c) {
++	case "amount", "vat", "amount_no_vat", "total":
++		return true
++	// «index» — роль графы «№ п/п» из rolesFor; «number» оставлено для старых вызовов
++	case "name", "qty", "unit", "price", "vat_rate", "number", "index":
++		return false
++	}
++	// роль не определена — судим по содержимому на месте вызова
++	return true
++}
++
++func roleUnknown(roles []string, c int) bool {
++	r := roleAt(roles, c)
++	return r == "" || r == "other"
++}
++
+ func TableFromWords(words []wordBox) *domain.FreeTable {
+ 	toks := make([]token, 0, len(words))
+ 	for _, w := range words {
+@@ -190,6 +371,12 @@ func TableFromWords(words []wordBox) *domain.FreeTable {
+ 			}
+ 			continue
+ 		}
++		// Сумма прописью без цифр («Тридцать шесть рублей») — подвал, а не перенос
++		// наименования. Приклеенная к изуродованному «ИТ0ГО», она делала из строки
++		// итога позицию с «настоящим названием», и документ удваивался.
++		if !reNumberish.MatchString(joined) && isSpelledAmount(joined) {
++			continue
++		}
+ 		// Перенос наименования: заполнена только текстовая графа, чисел нет.
+ 		if len(ft.Rows) > 0 && isNameContinuation(cells, ft.Roles) {
+ 			appendToFreeName(ft.Rows[len(ft.Rows)-1], cells, ft.Roles)
+@@ -202,7 +389,15 @@ func TableFromWords(words []wordBox) *domain.FreeTable {
+ 	}
+ 
+ 	MergeNameFragments(ft)
++	// Итог сверяется по ПОЛНОМУ набору строк, до схлопывания повторов: законные
++	// одинаковые позиции («Аренда» дважды) схлопывались, сумма переставала
++	// сходиться, и итог оставался позицией. Не сошлось — вторая
++	// попытка после схлопывания, для повторов, наплоденных распознаванием.
++	taken := takeGarbledTotalsRow(ft)
+ 	ft.Rows = dropDegenerateRows(ft.Rows)
++	if !taken {
++		takeGarbledTotalsRow(ft)
++	}
+ 	if len(ft.Rows) == 0 {
+ 		return nil
+ 	}
+@@ -212,7 +407,139 @@ func TableFromWords(words []wordBox) *domain.FreeTable {
+ // groupTokenRows собирает слова в строки по вертикальному перекрытию. Порог по
+ // перекрытию, а не по расстоянию между верхами боксов: на скане с наклоном
+ // строка уезжает, и сравнение верхов рвёт её пополам.
++// ── поправка на поворот листа ───────────────────────────────────
++//
++// Часть сканов снята с рук и повёрнута на 2-3 градуса. Строка при этом уходит
++// вниз пропорционально сдвигу вправо: на листе шириной 2300 точек это 60-100
++// точек, то есть три-четыре высоты слова. Группировка строк по перекрытию
++// боксов такую строку неизбежно рвёт, куски прилипают к соседним строкам, и
++// дальше рушится всё: шапка смешивается с первой позицией, значения уезжают
++// «лесенкой» (IMG_0126, 0201, 0216).
++//
++// Это НЕ тот сдвиг, что лечит table_skew.go: там ступенька от графы к графе,
++// накопительная и не связанная с координатой X. Здесь — обычный поворот, и
++// правится он до группировки, одним наклоном всей страницы.
++//
++// Угол берём медианой по парам слов, стоящих заведомо на одной строке:
++// разнесены по горизонтали не меньше чем на 150 точек, а по вертикали не
++// больше чем на высоту слова. Медиана устойчива к случайным парам.
++
++func estimateSkewBand(toks []token, lo, hi float64) float64 {
++	var slopes []float64
++	var in []token
++	for _, t := range toks {
++		if t.Y0 >= lo && t.Y0 <= hi {
++			in = append(in, t)
++		}
++	}
++	for i := 0; i < len(in); i++ {
++		h := in[i].Y1 - in[i].Y0
++		if h <= 0 {
++			continue
++		}
++		for j := i + 1; j < len(in); j++ {
++			// Ограничение. Направление наклона оценка различает:
++			// лист с k < 0 выпрямляется (TestDeskewNoDoubleShift, k = -0.03). Но
++			// замер на синтетике показал, что k = -0.045 не выпрямляется; причина
++			// не установлена. Симметричный перебор (dx<0 → развернуть пару)
++			// пробовали: роняет замер с 28 из 36 до 26 и ломает тест перекоса —
++			// пары «назад» связывают слова из разных строк. Чинить вместе с
++			// нормальной кластеризацией строк.
++			dx := in[j].X0 - in[i].X0
++			dy := in[j].Y0 - in[i].Y0
++			if dx < 150 || dx > 2000 {
++				continue
++			}
++			if math.Abs(dy) > h*1.2 {
++				continue
++			}
++			slopes = append(slopes, dy/dx)
++		}
++	}
++	if len(slopes) < 12 {
++		return 0
++	}
++	sort.Float64s(slopes)
++	k := slopes[len(slopes)/2]
++	if math.Abs(k) < 0.020 || math.Abs(k) > 0.05 {
++		return 0
++	}
++	return k
++}
++
++// deskewTokens выпрямляет слова ПОЛОСАМИ по высоте листа: перекос бывает не у
++// всей страницы, а только там, где данные впечатаны поверх ровного бланка
++// (IMG_0126: по всему листу наклон ноль, в табличной зоне 0.031).
++func deskewTokens(toks []token) []token {
++	if len(toks) == 0 {
++		return toks
++	}
++	minY, maxY := toks[0].Y0, toks[0].Y0
++	for _, t := range toks {
++		if t.Y0 < minY {
++			minY = t.Y0
++		}
++		if t.Y0 > maxY {
++			maxY = t.Y0
++		}
++	}
++	const band = 160.0
++	out := make([]token, len(toks))
++	copy(out, toks)
++	for lo := minY; lo <= maxY; lo += band {
++		hi := lo + band
++		k := estimateSkewBand(toks, lo-band/2, hi+band/2)
++		if k == 0 {
++			continue
++		}
++		// принадлежность полосе берём по ИСХОДНОЙ координате: если читать
++		// уже сдвинутый out, слово, опустившееся в следующую полосу, получит
++		// вторую поправку
++		for i := range out {
++			if toks[i].Y0 >= lo && toks[i].Y0 < hi {
++				d := k * toks[i].X0
++				out[i].Y0 -= d
++				out[i].Y1 -= d
++			}
++		}
++	}
++	return out
++}
++
++// groupTokenRows собирает слова в строки. Поправку на перекос применяем не
++// вслепую: строим строки и так, и так, и берём вариант, где строк МЕНЬШЕ.
++// Правильная геометрия склеивает обрывки, неправильная плодит их — на плотном
++// счёте IMG_0217 поправка добавляла две лишние строки и ломала уже собранную
++// таблицу, хотя другим документам помогала.
+ func groupTokenRows(toks []token) []tokenRow {
++	plain := groupTokenRowsRaw(toks)
++	fixed := groupTokenRowsRaw(deskewTokens(toks))
++	if rowsDensity(fixed) > rowsDensity(plain)*1.02 {
++		return fixed
++	}
++	return plain
++}
++
++// rowsDensity — насколько плотно набиты строки. Слова, разорванные по строкам
++// из-за перекоса, дают много коротких строк; собранные — меньше и длиннее.
++// Считаем среднее число слов в строке, игнорируя строки из одного слова:
++// в шапке и подписях они законны и картину искажают.
++func rowsDensity(rows []tokenRow) float64 {
++	words, cnt := 0, 0
++	for _, r := range rows {
++		if len(r.Toks) < 2 {
++			continue
++		}
++		words += len(r.Toks)
++		cnt++
++	}
++	if cnt == 0 {
++		return 0
++	}
++	return float64(words) / float64(cnt)
++}
++
++func groupTokenRowsRaw(toks []token) []tokenRow {
+ 	sorted := make([]token, len(toks))
+ 	copy(sorted, toks)
+ 	sort.SliceStable(sorted, func(i, j int) bool {
+@@ -982,3 +1309,29 @@ func moneyRowsBelow(rows []tokenRow, from int) int {
+ 	}
+ 	return n
+ }
++
++// rowHasRealName — стоит ли в графе наименования настоящее название, а не
++// огрызок итога. Судим по словам (totals_words.go): настоящее — хоть одно слово
++// из трёх и более букв, которое не изуродованное «ИТОГО» и не хвост итоговой
++// строки («по счёту», «НДС»). Прежний признак «два слова или длиннее 12 букв»
++// оставлял позицией «ИТ0Г0 по счёту» и съедал «Теплоэнергию».
++func rowHasRealName(roles []string, cells []string) bool {
++	for c, cell := range cells {
++		if roleAt(roles, c) != "name" {
++			continue
++		}
++		t := strings.TrimSpace(cell)
++		if t == "" {
++			continue
++		}
++		if reTotalsRow.MatchString(t) {
++			return false
++		}
++		for _, w := range strings.Fields(t) {
++			if isNameWord(w) {
++				return true
++			}
++		}
++	}
++	return false
++}
+diff --git a/docflow/internal/recognize/header_totals_cases_test.go b/docflow/internal/recognize/header_totals_cases_test.go
+new file mode 100644
+index 0000000..aa6bf33
+--- /dev/null
++++ b/docflow/internal/recognize/header_totals_cases_test.go
+@@ -0,0 +1,191 @@
++package recognize
++
++import (
++	"strings"
++	"testing"
++)
++
++// Номер документа и строка итога: пограничные раскладки. Сценарии
++// построены на реальных документах и правке их слов на их же местах.
++
++// replaceLeftOf убирает слова строки anchor левее xmax и кладёт на их место новые.
++func replaceLeftOf(t *testing.T, ws []wordBox, anchor string, xmax float64, repl ...placed) []wordBox {
++	t.Helper()
++	y0, y1, ok := rowBounds(ws, anchor)
++	if !ok {
++		t.Fatalf("в раскладке нет слова %q", anchor)
++	}
++	out := make([]wordBox, 0, len(ws)+len(repl))
++	for _, w := range ws {
++		if sameRow(w, y0, y1) && w.X0 < xmax {
++			continue
++		}
++		out = append(out, w)
++	}
++	for _, p := range repl {
++		out = append(out, wordBox{Text: p.text, X0: p.x0, X1: p.x1, Y0: y0, Y1: y1})
++	}
++	return out
++}
++
++// lineOf раскладывает слова строки подряд по горизонтали.
++func lineOf(y, x float64, words ...string) []wordBox {
++	var out []wordBox
++	for _, w := range words {
++		width := float64(len([]rune(w))) * 12
++		out = append(out, wb(w, x, y, width))
++		x += width + 10
++	}
++	return out
++}
++
++func withSupplier(ws []wordBox) []wordBox {
++	return append(ws, lineOf(140, 300, "Исполнитель:", "ООО", "Ромашка", "г.", "Минск")...)
++}
++
++// Номер строго под названием берётся без проверок владельца, места и даты.
++func TestHeaderVerticalPathChecksOwner(t *testing.T) {
++	w126 := func() []wordBox { return loadWordsTSV(t, "testdata/header-126-words.tsv") }
++
++	t.Run("«по договору» в строке названия, номер договора в полосе названия", func(t *testing.T) {
++		ws := appendToRow(t, w126(), "AKT", placed{"выполненных", 1350, 1480}, placed{"работ", 1490, 1560},
++			placed{"по", 1570, 1600}, placed{"договору", 1610, 1720})
++		ws = replaceRow(t, ws, "сдачи-приемки", placed{"аренды", 1100, 1200}, placed{"№", 1250, 1280},
++			placed{"42", 1295, 1330}, placed{"от", 1340, 1370}, placed{"01.03.2022", 1380, 1500})
++		if got := HeaderNumberFromWords(ws); got != "" {
++			t.Errorf("получено %q — номер договора с перенесённой строки", got)
++		}
++	})
++
++	t.Run("«Помещение № 5» в полосе названия", func(t *testing.T) {
++		ws := appendToRow(t, w126(), "AKT", placed{"от", 1350, 1380}, placed{"30.09.2023", 1390, 1500})
++		ws = replaceRow(t, ws, "сдачи-приемки", placed{"Помещение", 1100, 1250}, placed{"№", 1260, 1285},
++			placed{"5", 1300, 1320})
++		if got := HeaderNumberFromWords(ws); got != "" {
++			t.Errorf("получено %q — номер помещения", got)
++		}
++	})
++
++	t.Run("IMG_0216: «пом. 8» из адреса под названием", func(t *testing.T) {
++		if got := HeaderNumberFromWords(loadWordsTSV(t, "testdata/header-0216-words.tsv")); got == "8" {
++			t.Errorf("получено %q — номер помещения из адреса", got)
++		}
++	})
++}
++
++// Строка со словом «Договор» слева на высоте номера обрывала поиск.
++func TestHeaderContractWordLeftOfNumber(t *testing.T) {
++	cases := map[string][]placed{
++		"Договор № 5/20 от …":    {{"Договор", 460, 560}, {"№", 570, 590}, {"5/20", 600, 660}, {"от", 670, 700}, {"01.11.2020", 710, 900}},
++		"Договор 5/20 от …":      {{"Договор", 460, 560}, {"5/20", 600, 660}, {"от", 670, 700}, {"01.11.2020", 710, 900}},
++		"Основание: договор № 7": {{"Основание:", 460, 560}, {"договор", 570, 660}, {"№", 670, 690}, {"7", 700, 720}},
++	}
++	for name, left := range cases {
++		ws := replaceLeftOf(t, loadWordsTSV(t, "testdata/header-218-words.tsv"), `"Минсктранс"`, 1000, left...)
++		if got := HeaderNumberFromWords(ws); got != "118" {
++			t.Errorf("%s: получено %q, ожидалось 118 — строка с договором оборвала поиск номера", name, got)
++		}
++	}
++}
++
++// «АКТ № б/н» — документ без номера: число в полосе названия ниже (сумма) номером
++// не становится. Стоп по «б/н» держит именно это, остальные проверки число пропускают.
++func TestHeaderOwnNoNumberStopsSearch(t *testing.T) {
++	ws := appendToRow(t, loadWordsTSV(t, "testdata/header-126-words.tsv"), "AKT",
++		placed{"№", 1350, 1370}, placed{"б/н", 1380, 1440}, placed{"от", 1460, 1500}, placed{"30.09.2023", 1520, 1700})
++	ws = replaceRow(t, ws, "сдачи-приемки", placed{"Сумма:", 1000, 1100}, placed{"300", 1290, 1330})
++	if got := HeaderNumberFromWords(ws); got != "" {
++		t.Errorf("получено %q — у акта «№ б/н» номера нет", got)
++	}
++}
++
++// Под названием строка с другим названием, и номер ТОГО документа стоит в полосе
++// нашего названия: «Договор № 77» под «СЧЕТ-ФАКТУРА». Номер договора не наш.
++func TestHeaderOtherTitleNumberInOurBand(t *testing.T) {
++	ws := replaceLeftOf(t, loadWordsTSV(t, "testdata/header-218-words.tsv"), `"Минсктранс"`, 2100,
++		placed{"Договор", 1700, 1850}, placed{"№", 1900, 1925}, placed{"77", 2010, 2050})
++	if got := HeaderNumberFromWords(ws); got != "" {
++		t.Errorf("получено %q — номер договора из строки под названием", got)
++	}
++}
++
++// «б/н» чужого документа после собственного номера стирал свой номер.
++func TestHeaderForeignNoNumberAfterOwnNumber(t *testing.T) {
++	cases := map[string]struct {
++		ws   []wordBox
++		want string
++	}{
++		"АКТ № 15 … к ТТН б/н":           {withSupplier(lineOf(100, 300, "АКТ", "№", "15", "от", "01.09.2023", "к", "ТТН", "б/н")), "15"},
++		"Счет-фактура № 12 … к акту б/н": {withSupplier(lineOf(100, 300, "Счет-фактура", "№", "12", "от", "01.09.2023", "к", "акту", "б/н")), "12"},
++		"АКТ № 15 … по договору б/н":     {withSupplier(lineOf(100, 300, "АКТ", "№", "15", "от", "01.09.2023", "по", "договору", "б/н")), "15"},
++		"IMG_0209 + «Договор б/н»":       {appendToRow(t, loadWordsTSV(t, "testdata/header-0209-words.tsv"), "№371", placed{"Договор", 1900, 2000}, placed{"б/н", 2010, 2050}), "371"},
++		"IMG_0209 + «ТТН б/н»":           {appendToRow(t, loadWordsTSV(t, "testdata/header-0209-words.tsv"), "№371", placed{"ТТН", 1900, 1950}, placed{"б/н", 1960, 2000}), "371"},
++		"собственный б/н без номера":     {withSupplier(lineOf(100, 300, "АКТ", "б/н", "от", "01.09.2023", "Договор", "№", "42")), ""},
++	}
++	for name, c := range cases {
++		if got := HeaderNumberFromWords(c.ws); got != c.want {
++			t.Errorf("%s: получено %q, ожидалось %q", name, got, c.want)
++		}
++	}
++}
++
++// Название с предлогом («по ТТН №», «к акту №») — чужой документ.
++func TestHeaderTitleWithPrepositionIsForeign(t *testing.T) {
++	cases := map[string]struct {
++		ws   []wordBox
++		want string
++	}{
++		"акт по ТТН № 1234567":     {withSupplier(lineOf(100, 300, "АКТ", "приемки", "товара", "по", "ТТН", "№", "1234567", "от", "01.02.2023")), ""},
++		"акт к акту № 45":          {withSupplier(lineOf(100, 300, "Акт", "выполненных", "работ", "к", "акту", "№", "45", "от", "01.02.2023")), ""},
++		"свой номер раньше ссылки": {withSupplier(lineOf(100, 300, "АКТ", "№", "15", "от", "01.09.2023", "к", "ТТН", "№", "1234567")), "15"},
++	}
++	for name, c := range cases {
++		if got := HeaderNumberFromWords(c.ws); got != c.want {
++			t.Errorf("%s: получено %q, ожидалось %q", name, got, c.want)
++		}
++	}
++}
++
++// Знак «№» в конце строки названия, ниже дата словами — день не номер.
++func TestHeaderDanglingSignSkipsDateDay(t *testing.T) {
++	ws := replaceRow(t, loadWordsTSV(t, "testdata/header-0161-words.tsv"), "810",
++		placed{"от", 1660, 1690}, placed{"15", 1700, 1730}, placed{"сентября", 1740, 1860},
++		placed{"2023", 1870, 1930}, placed{"г.", 1940, 1960})
++	if got := HeaderNumberFromWords(ws); got != "" {
++		t.Errorf("получено %q — день из даты «от 15 сентября»", got)
++	}
++}
++
++// Изуродованное «ИТОГО»/«ВСЕГО» не из пяти букв, со знаком или латиницей.
++func totalsTable(last string) []wordBox {
++	hdr := []wordBox{wb("Наименование", 700, 100, 84), wb("Сумма", 1045, 100, 35), wb("НДС", 1160, 100, 21), wb("Всего", 1215, 100, 35)}
++	row := func(y float64, name, a, b, c string) []wordBox {
++		return []wordBox{wb(name, 700, y, float64(len([]rune(name)))*7), wb(a, 1040, y, 40), wb(b, 1158, y, 34), wb(c, 1212, y, 40)}
++	}
++	out := append(hdr, row(132, "Вода", "10,00", "2,00", "12,00")...)
++	out = append(out, row(148, "Стоки", "20,65", "4,13", "24,78")...)
++	return append(out, row(164, last, "30,65", "6,13", "36,78")...)
++}
++
++func TestGarbledTotalWordVariants(t *testing.T) {
++	for _, w := range []string{"ИТ0ГО", "ИТГО", "ИТОГ0О", "ИТ0Г", "|ИТ0ГО", "||ИТ0ГО", "ИТ0ГО:36,78", "ИТ0ГО:10,00", "Bcero", "BCEГО", "ВСЕГ0", "ВСЕО"} {
++		ft := TableFromWords(totalsTable(w))
++		if ft == nil {
++			t.Fatalf("%s: таблица не собрана", w)
++		}
++		if len(ft.Rows) != 2 || !strings.Contains(strings.Join(ft.Totals, " "), "36,78") {
++			t.Errorf("%s: итог остался позицией (строк %d, итог %q)", w, len(ft.Rows), ft.Totals)
++		}
++	}
++	// настоящие короткие наименования с совпавшей суммой остаются позициями
++	for _, w := range []string{"Пилот", "Отвод", "Вход"} {
++		ft := TableFromWords(totalsTable(w))
++		if ft == nil || len(ft.Rows) != 3 {
++			n := 0
++			if ft != nil {
++				n = len(ft.Rows)
++			}
++			t.Errorf("%s: позиция съедена как итог (строк %d)", w, n)
++		}
++	}
++}
+diff --git a/docflow/internal/recognize/headernum.go b/docflow/internal/recognize/headernum.go
+index 326c11b..4374ed5 100644
+--- a/docflow/internal/recognize/headernum.go
++++ b/docflow/internal/recognize/headernum.go
+@@ -20,13 +20,50 @@ import (
+ 
+ var (
+ 	// Слова-названия документов, к которым привязан номер.
+-	reTitleWord = regexp.MustCompile(`(?i)^(счет|счёт|счет-фактура|счёт-фактура|эсчф|накладная|акт|тн|ттн|тн-2|ттн-1|упд|доверенность|договор)[-,.:]?$`)
++	// «Счет-акт на оплату аренды № А0000000860» — составное название через
++	// дефис встречается в белорусских бланках постоянно.
++	reTitleWord = regexp.MustCompile(`(?i)^(счет|счёт|счет-фактура|счёт-фактура|счет-акт|счёт-акт|эсчф|накладная|акт|тн|ттн|тн-2|ттн-1|упд|доверенность|договор)[-,.:]?$`)
+ 	// Номер: цифры, возможно с буквами и разделителями. Не дата и не сумма.
+-	reNumToken = regexp.MustCompile(`^(?:№\s*)?([0-9][0-9A-Za-zА-Яа-я\-/]{0,19})$`)
++	// Номер начинается и с буквы: в белорусских бланках это серия — АП4531279,
++	// У-000484, Э0000000750. Требование «первый символ цифра» теряло их все.
++	// Буквенная часть не длиннее двух символов, иначе это слово, а не номер.
++	reNumToken = regexp.MustCompile(`^(?:№\s*)?([0-9A-Za-zА-Яа-я]{0,2}-?[0-9][0-9A-Za-zА-Яа-я\-/]{0,19})$`)
+ 	// Строки, рядом с которыми номер документа не стоит.
+-	reNotNumberRow = regexp.MustCompile(`(?i)(унп|унн|инн|окпо|р/с|расч|бик|bic|поручени|телефон|тел\.|индекс|январ|феврал|март|апрел|мая|май|июн|июл|август|сентябр|октябр|ноябр|декабр)`)
+-	reDateLike     = regexp.MustCompile(`^\d{1,2}[.\-/]\d{1,2}([.\-/]\d{2,4})?$`)
+-	reYearLike     = regexp.MustCompile(`^(19|20)\d{2}$`)
++	// Месяцы словами отсюда убраны намеренно: «Счет-фактура № 85906 от 11
++	// Августа 2023 г.» — обычная дата документа, а строка отвергалась целиком
++	// вместе с настоящим номером. Месяц мешает, только если строка ИМ и
++	// начинается («Август 2023» в графе периода) — это ловится ниже.
++	reNotNumberRow = regexp.MustCompile(`(?i)(унп|унн|инн|окпо|р/с|расч|бик|bic|поручени|телефон|тел\.|индекс)`)
++	reMonthStart   = regexp.MustCompile(`(?i)^(январ|феврал|март|апрел|мая|май|июн|июл|август|сентябр|октябр|ноябр|декабр)`)
++	// «Договор» — название документа, но самое слабое: если на листе есть акт
++	// или счёт, их номер важнее.
++	reContractTitle = regexp.MustCompile(`(?i)^(договор|контракт)[-,.:]?$`)
++	reDateLike      = regexp.MustCompile(`^\d{1,2}[.\-/]\d{1,2}([.\-/]\d{2,4})?$`)
++	// «б/н» — документ выписан без номера, и любой номер в этой строке чужой.
++	reNoNumberMark = regexp.MustCompile(`(?i)(^|\s)б\s?/\s?н($|\s|,|\.)`)
++	// Знак «№» после этих слов открывает номер ДОГОВОРА, а не документа:
++	// «Акт выполненных работ б/н по договору аренды от 01.03.2022г. №42».
++	// Знак «№» после этих слов открывает номер ЧУЖОГО документа: договора,
++	// счёта поставщика, накладной, спецификации. Пример: «Акт выполненных
++	// работ к счету № 45» ставил акту номер счёта, и документы схлопывались.
++	reOtherNumOwner = regexp.MustCompile(`(?i)^(договор|контракт|заказ|заявк|смет|спецификаци|приложени|счет|счёт|счет-фактур|счёт-фактур|накладн|поручени|платежк|требовани|претензи|письм|прейскурант|тариф|акту$|акта$|актом$)`)
++	// «Форма № 868», «бланк № 5» — номер бланка, но только когда слово стоит прямо
++	// перед знаком. Префиксом «форм/бланк» по всей строке стирался собственный
++	// номер: «АКТ списания бланков … № 12», «по формированию отчетности № 15».
++	reFormOwner = regexp.MustCompile(`(?i)^(форма|формы|форме|бланк|бланка|образец|образца)[.,:]?$`)
++	// «Лицевой счет № 123456», «Расчетный счет» — реквизит, а не название документа
++	reAccountWordBefore = regexp.MustCompile(`^(лицев|расчетн|расчётн|текущ|р/с|р/сч)`)
++	// год бывает с приклеенной «г»: «2024г», «2023г.» — это не номер документа
++	reYearLike = regexp.MustCompile(`^(19|20)\d{2}\s*(г|г\.|года|году)?[.,]?$`)
++)
++
++// latinLookalikes приводит латинские буквы, неотличимые по начертанию от
++// кириллических, к кириллице: распознавание регулярно отдаёт AKT вместо АКТ и
++// CЧET вместо СЧЕТ, и слово-название документа переставало опознаваться.
++var latinLookalikes = strings.NewReplacer(
++	"A", "А", "B", "В", "C", "С", "E", "Е", "H", "Н", "K", "К", "M", "М",
++	"O", "О", "P", "Р", "T", "Т", "X", "Х", "Y", "У",
++	"a", "а", "c", "с", "e", "е", "o", "о", "p", "р", "x", "х", "y", "у",
+ )
+ 
+ // HeaderNumberFromWords возвращает номер документа, найденный по расположению
+@@ -35,6 +72,9 @@ func HeaderNumberFromWords(words []wordBox) string {
+ 	toks := make([]token, 0, len(words))
+ 	for _, w := range words {
+ 		t := normalizeNoSign(StripMath(strings.TrimSpace(w.Text)))
++		if reTitleWord.MatchString(latinLookalikes.Replace(t)) {
++			t = latinLookalikes.Replace(t)
++		}
+ 		if t == "" || w.X1 <= w.X0 || w.Y1 <= w.Y0 {
+ 			continue
+ 		}
+@@ -53,40 +93,211 @@ func HeaderNumberFromWords(words []wordBox) string {
+ 		limit = first
+ 	}
+ 
++	// Тип документа задаёт самое верхнее название на листе. Строки реквизитов
++	// не в счёт: «Расчетный счет» — не счёт.
++	//
++	// «Договор» — тоже название документа. Если сверху акт или
++	// счёт, номер договора ему чужой при любом раскладе («АКТ № б/н», ниже
++	// «Договор аренды №А-48-22» — в 1С уезжал номер договора), и пустое поле
++	// лучше. Обратно: если сверху договор, слово «акт» ниже — это текст
++	// договора («Акт сдачи-приемки подписывается сторонами … 5 дней»), а не
++	// заголовок, и номер берётся только у договора.
++	top := -1
+ 	for i := 0; i < limit; i++ {
++		if titleTokenIndex(rows[i]) >= 0 && !reNotNumberRow.MatchString(rowText(rows[i])) {
++			top = i
++			break
++		}
++	}
++	if top < 0 {
++		return ""
++	}
++	wantContract := isContractRow(rows[top])
++	for i := top; i < limit; i++ {
+ 		ti := titleTokenIndex(rows[i])
+-		if ti < 0 {
++		if ti < 0 || isContractRow(rows[i]) != wantContract {
+ 			continue
+ 		}
+-		title := rows[i].Toks[ti]
+-
+-		// Сначала — справа от названия на той же строке.
+-		if n := numberRightOf(rows[i], ti); n != "" {
++		n, stop := numberForTitle(rows, i, ti, limit)
++		if n != "" {
+ 			return n
+ 		}
+-		// Затем — ниже, в той же вертикальной полосе: так набран бланк, где
+-		// название стоит шапкой, а номер под ним.
+-		for j := i + 1; j < limit && j <= i+3; j++ {
+-			line := rowText(rows[j])
+-			if reNotNumberRow.MatchString(line) {
++		if stop {
++			return ""
++		}
++	}
++	return ""
++}
++
++func isContractRow(r tokenRow) bool {
++	ti := titleTokenIndex(r)
++	return ti >= 0 && reContractTitle.MatchString(strings.Trim(r.Toks[ti].Text, "«»\"'"))
++}
++
++// numberForTitle ищет номер у названия в строке i. stop — документ прямо
++// объявлен без номера («б/н»): искать дальше нельзя, любой найденный будет чужим.
++func numberForTitle(rows []tokenRow, i, ti, limit int) (string, bool) {
++	title := rows[i].Toks[ti]
++	if noNumberMark(rows[i], ti) {
++		return "", true
++	}
++	// Сначала — справа от названия на той же строке.
++	if n := numberRightOf(rows[i], ti); n != "" {
++		return n, false
++	}
++	// Затем — ниже.
++	for j := i + 1; j < limit && j <= i+3; j++ {
++		tj := titleTokenIndex(rows[j])
++		if reNotNumberRow.MatchString(rowText(rows[j])) {
++			if tj >= 0 {
++				break
++			}
++			continue
++		}
++		// Строка ниже может нести ДРУГОЕ название («Договор № 5/20 от …» слева, в
++		// реквизитах плательщика) и при этом номер нашего документа справа, в полосе
++		// названия. Обрыв поиска на такой строке терял номер 118.
++		// Поэтому сначала проверка по вертикали, но номер, который принадлежит тому
++		// другому названию, не берётся.
++		otherNum := ""
++		if tj >= 0 {
++			otherNum = numberRightOf(rows[j], tj)
++		}
++		// Строго под названием, в той же вертикальной полосе: так набран бланк,
++		// где название стоит шапкой, а номер под ним. Эта проверка идёт раньше
++		// переноса: на счёте-фактуре номер 118 стоит под
++		// названием, а слева на той же строке «Банк: ЦБУ № 527».
++		//
++		// Проверки владельца, места и даты — те же, что справа от названия,
++		// иначе «пом. 8» из адреса, «Помещение № 5», номер договора с
++		// перенесённой строки «Акт … по договору» / «аренды № 42» уезжали номером
++		// документа. Владелец ищется по склейке «хвост строки названия + строка ниже».
++		ctx := tokenRow{Toks: append(append([]token{}, rows[i].Toks[ti:]...), rows[j].Toks...)}
++		off := len(rows[i].Toks) - ti
++		for k, t := range rows[j].Toks {
++			if !xOverlaps(title, t) || isAddressPart(rows[j], k) || afterPlaceWord(rows[j], k) || isDatePart(rows[j], k) {
++				continue
++			}
++			if k > 0 && strings.TrimSpace(rows[j].Toks[k-1].Text) == "№" && afterPlaceWord(rows[j], k-1) {
+ 				continue
+ 			}
+-			for _, t := range rows[j].Toks {
+-				if !xOverlaps(title, t) {
++			if numberBelongsToOther(ctx, off+k) {
++				continue
++			}
++			if n := plainNumber(t.Text); n != "" {
++				if tj >= 0 && n == otherNum {
+ 					continue
+ 				}
+-				if n := plainNumber(t.Text); n != "" {
+-					return n
++				return n, false
++			}
++		}
++		if tj >= 0 {
++			// ниже другое название — это уже другая строка документа
++			// («Договор аренды №А-48-22»), переноса нашего заголовка там нет
++			break
++		}
++		// Заголовок в две строки: «AKT» отдельно, под ним «сдачи-приемки
++		// выполненных работ №У-000484». Только сразу под названием, только по
++		// знаку «№», и строка читается как ПРОДОЛЖЕНИЕ названия: так «по
++		// договору» в конце первой строки делает номер со второй чужим, а
++		// «Помещение № 5» или индекс без знака номером не становятся.
++		if j == i+1 {
++			joined := tokenRow{Toks: append(append([]token{}, rows[i].Toks[ti:]...), rows[j].Toks...)}
++			if noNumberMark(joined, 0) {
++				return "", true
++			}
++			if n := numberBySign(joined, 0); n != "" {
++				return n, false
++			}
++			if n := numberAfterDanglingSign(rows[i], ti, rows[j]); n != "" {
++				return n, false
++			}
++			// Под названием одно число и больше ничего: номер бланка под
++			// штрихкодом («ТОВАРНАЯ НАКЛАДНАЯ» / «1333337», IMG_0001).
++			if len(rows[j].Toks) == 1 && rows[j].Toks[0].X0 >= title.X0 {
++				if n := plainNumber(rows[j].Toks[0].Text); n != "" {
++					return n, false
+ 				}
+ 			}
+ 		}
+ 	}
++	return "", false
++}
++
++// numberAfterDanglingSign — строка названия кончается знаком «№», а сам номер
++// распознавание унесло на строку ниже, правее знака: «СЧЕТ-ФАКТУРА №» /
++// «31.08.2023 г. 810» (IMG_0161; на бумаге номер стоит в той же строке).
++func numberAfterDanglingSign(r tokenRow, ti int, next tokenRow) string {
++	last := len(r.Toks) - 1
++	if last <= ti || strings.TrimSpace(r.Toks[last].Text) != "№" || numberBelongsToOther(r, last) {
++		return ""
++	}
++	sign := r.Toks[last]
++	for k, t := range next.Toks {
++		// «от 15 сентября 2023 г.» правее знака — день даты, а не номер
++		if t.X0 <= sign.X0 || isAddressPart(next, k) || isDatePart(next, k) {
++			continue
++		}
++		if n := plainNumber(t.Text); n != "" {
++			return n
++		}
++	}
+ 	return ""
+ }
+ 
++// noNumberMark — после названия стоит «б/н», относящийся к самому документу, а
++// не к чужому («по договору б/н»).
++var reNoNumberToken = regexp.MustCompile(`(?i)^(№\s*)?б\s?/\s?н[.,:;]?$`)
++
++func noNumberMark(r tokenRow, from int) bool {
++	for k := from + 1; k < len(r.Toks); k++ {
++		// Свой номер по знаку стоит раньше «б/н» — пометка относится к документу,
++		// на который ссылаются: «Счет-фактура №371 от 31.08.2023 Договор б/н»
++		// стирал номер 371.
++		if ownNumberBySignAt(r, k) {
++			return false
++		}
++		w := latinLookalikes.Replace(strings.TrimSpace(r.Toks[k].Text))
++		if reNoNumberToken.MatchString(w) && !numberBelongsToOther(r, k) {
++			return true
++		}
++	}
++	return false
++}
++
++// ownNumberBySignAt — в позиции k стоит знак «№» (отдельно или слитно с номером),
++// за ним годный номер, и номер не чужой.
++func ownNumberBySignAt(r tokenRow, k int) bool {
++	t := strings.TrimSpace(r.Toks[k].Text)
++	switch {
++	case t == "№":
++		return k+1 < len(r.Toks) && plainNumberAfterSign(r.Toks[k+1].Text) != "" && !numberBelongsToOther(r, k)
++	case strings.HasPrefix(t, "№"):
++		return plainNumberAfterSign(strings.TrimPrefix(t, "№")) != "" && !numberBelongsToOther(r, k)
++	}
++	return false
++}
++
++// isAddressPart — число является частью адреса: за ним «г.», «ул.», перед ним
++// «Адрес:». Почтовый индекс под одиноким «АКТ» уезжал номером документа.
++var reAddressNext = regexp.MustCompile(`(?i)^(г|гор|ул|пр|пр-т|д)(\.|,|$)`)
++
++func isAddressPart(r tokenRow, k int) bool {
++	if k+1 < len(r.Toks) && reAddressNext.MatchString(strings.TrimSpace(r.Toks[k+1].Text)) {
++		return true
++	}
++	return k > 0 && strings.HasPrefix(strings.ToLower(strings.TrimSpace(r.Toks[k-1].Text)), "адрес")
++}
++
+ func titleTokenIndex(r tokenRow) int {
+ 	for i, t := range r.Toks {
+ 		if reTitleWord.MatchString(strings.Trim(t.Text, "«»\"'")) {
++			if i > 0 {
++				prev := strings.ToLower(strings.TrimSpace(r.Toks[i-1].Text))
++				if reAccountWordBefore.MatchString(prev) {
++					continue
++				}
++			}
+ 			return i
+ 		}
+ 	}
+@@ -94,11 +305,23 @@ func titleTokenIndex(r tokenRow) int {
+ }
+ 
+ func numberRightOf(r tokenRow, from int) string {
+-	line := rowText(r)
+-	if reNotNumberRow.MatchString(line) {
++	if n := numberBySign(r, from); n != "" {
++		return n
++	}
++	if rowRejected(r) {
+ 		return ""
+ 	}
++	// Знака нет — как раньше, ближайшее подходящее слово справа. Но не любое:
++	// после снятия месяцев из стоп-списка сюда стал попадать ДЕНЬ из даты
++	// («СЧЕТ-ФАКТУРА от 11 Августа 2023 г.» давал номер «11») и номера
++	// помещений.
+ 	for i := from + 1; i < len(r.Toks) && i <= from+3; i++ {
++		// владельца проверяем и здесь: без этого «Форма № 868» отдавала номер
++		// бланка как номер документа — знак блокировался, а запасной проход
++		// брал ту же цифру следующим шагом
++		if isDatePart(r, i) || afterPlaceWord(r, i) || numberBelongsToOther(r, i) || isAddressPart(r, i) {
++			continue
++		}
+ 		if n := plainNumber(r.Toks[i].Text); n != "" {
+ 			return n
+ 		}
+@@ -106,6 +329,67 @@ func numberRightOf(r tokenRow, from int) string {
+ 	return ""
+ }
+ 
++// rowRejected — строка, в которой номер документа не ищется: реквизиты, период,
++// пометка «б/н» до знака номера.
++func rowRejected(r tokenRow) bool {
++	line := rowText(r)
++	if reNotNumberRow.MatchString(line) || reMonthStart.MatchString(strings.TrimSpace(line)) {
++		return true
++	}
++	// «б/н» относится к документу, рядом с которым стоит. Проверяем только
++	// участок ДО первого знака номера: иначе пометка про чужой документ в конце
++	// строки стирала собственный номер.
++	head := line
++	if i := strings.Index(line, "№"); i > 0 {
++		head = line[:i]
++	}
++	return reNoNumberMark.MatchString(latinLookalikes.Replace(head))
++}
++
++// numberBySign — номер, на который указывает знак «№» правее слова from.
++func numberBySign(r tokenRow, from int) string {
++	if rowRejected(r) {
++		return ""
++	}
++	line := rowText(r)
++	// Сначала — по знаку «№»: он прямой указатель, и номер может стоять дальше
++	// трёх слов от названия («АКТ оказанных услуг № АП4531279 от 14.09.2023»).
++	// Знак бывает и слитно с номером: «№У-000484».
++	for i := from + 1; i < len(r.Toks); i++ {
++		t := strings.TrimSpace(r.Toks[i].Text)
++		if t == "№" {
++			// чей это номер: если выше по строке стоял «договор», то не наш
++			if i > 0 && numberBelongsToOther(r, i) {
++				continue
++			}
++			if i+1 < len(r.Toks) {
++				if n := plainNumberAfterSign(r.Toks[i+1].Text); n != "" {
++					// «Филиал "Троллейбусный парк №5"» — номер внутри названия
++					// организации, а не документа. Это исходный дефект, ради
++					// которого написан файл; в пути по знаку он вернулся.
++					if numberInsideQuotes(line, n) || afterPlaceWord(r, i) {
++						continue
++					}
++					return n
++				}
++			}
++			continue
++		}
++		if strings.HasPrefix(t, "№") && len(t) > len("№") {
++			if numberBelongsToOther(r, i) {
++				continue
++			}
++			if n := plainNumberAfterSign(strings.TrimPrefix(t, "№")); n != "" {
++				if numberInsideQuotes(line, n) || afterPlaceWord(r, i) {
++					continue
++				}
++				return n
++			}
++		}
++	}
++	return ""
++}
++
+ // plainNumber проверяет, что слово годится в номер документа: это не дата,
+ // не год, не сумма, не банковский счёт и не налоговый номер.
+ func plainNumber(s string) string {
+@@ -129,6 +413,10 @@ func plainNumber(s string) string {
+ 	if len(num) == 9 && isAllDigits(num) {
+ 		return ""
+ 	}
++	// «000» — это «ООО» из названия организации, прочитанное цифрами
++	if strings.Trim(num, "0") == "" {
++		return ""
++	}
+ 	return num
+ }
+ 
+@@ -200,3 +488,119 @@ func xOverlaps(a, b token) bool {
+ 	c := (b.X0 + b.X1) / 2
+ 	return c >= lo && c <= hi
+ }
++
++// numberBelongsToOther — стоит ли перед знаком «№» слово, которое делает номер
++// чужим: номером договора, заказа, заявки. Смотрим три слова назад, дальше
++// связь уже теряется.
++// numberBelongsToOther — чей это номер. Идём от знака «№» к началу строки и
++// смотрим, что встретится первым.
++//
++// Название САМОГО документа («Счет-акт», «Акт», «Договор») означает, что номер
++// наш. Слово в косвенном падеже («по договору», «к счету», «согласно
++// спецификации») — что номер чужой: так пишут про другой документ.
++//
++// Здесь сняты два прежних допущения. Первое: окно в три слова
++// пробивалось собственным мотивирующим примером («по договору аренды от
++// 01.03.2022г. №42» — «договору» стоит четвёртым). Второе: «название стоит
++// первым словом строки» — не всегда, слева бывает город («г. Минск Счет-акт на
++// оплату аренды № А0000000860»).
++func numberBelongsToOther(r tokenRow, at int) bool {
++	for k := at - 1; k >= 0; k-- {
++		// латиница, неотличимая от кириллицы («cчету» с латинской c), возвращала
++		// чужой номер
++		w := latinLookalikes.Replace(strings.Trim(strings.TrimSpace(r.Toks[k].Text), "«»\"'"))
++		if reTitleWord.MatchString(w) {
++			// «по ТТН №», «к счет-фактуре №» — название с предлогом: это ссылка на
++			// другой документ, номер чужой (акт без номера получал
++			// номер накладной)
++			if k > 0 && reTitlePreposition.MatchString(strings.TrimSpace(r.Toks[k-1].Text)) {
++				return true
++			}
++			return false
++		}
++		if reOtherNumOwner.MatchString(w) {
++			return true
++		}
++		// «Акт выполненных работ к № 45» — предлог сразу перед знаком, а слово-
++		// владелец съедено переносом или распознаванием: номер всё равно чужой
++		if k == at-1 && reOwnerPreposition.MatchString(w) {
++			return true
++		}
++		if reFormOwner.MatchString(w) && (k == at-1 || (k == at-2 && strings.TrimSpace(r.Toks[at-1].Text) == "№")) {
++			return true
++		}
++	}
++	return false
++}
++
++var reOwnerPreposition = regexp.MustCompile(`(?i)^(к|согласно)$`)
++
++// предлог перед словом-названием делает его ссылкой на чужой документ
++var reTitlePreposition = regexp.MustCompile(`(?i)^(к|по|согласно)$`)
++
++// plainNumberAfterSign — номер, стоящий сразу после знака «№». Здесь можно быть
++// мягче: знак прямо говорит, что это номер, и точка в нём не делает его суммой
++// («СЧЕТ-ФАКТУРА № 395.33»). Запятая по-прежнему запрещена — в белорусских
++// документах дробная часть пишется через неё, и «0,35» это деньги. Больше одной
++// точки — это код вида «10.07.01», а не номер.
++func plainNumberAfterSign(s string) string {
++	s = strings.TrimSpace(s)
++	if n := plainNumber(s); n != "" {
++		return n
++	}
++	// «27-09/23» после знака — номер, а не дата: в дате разделители одинаковые.
++	// Отброшенный как дата, он уступал место номеру договора (IMG_0153).
++	if strings.Contains(s, "-") && strings.Contains(s, "/") {
++		if m := reNumToken.FindStringSubmatch(s); m != nil {
++			if n := strings.Trim(m[1], "-/"); n != "" && !looksLikeAccountNumber(n) {
++				return n
++			}
++		}
++	}
++	if strings.Contains(s, ",") || strings.Count(s, ".") != 1 {
++		return ""
++	}
++	if reDateLike.MatchString(s) || reYearLike.MatchString(s) {
++		return ""
++	}
++	head, tail, _ := strings.Cut(s, ".")
++	if head == "" || tail == "" || !isAllDigits(tail) {
++		return ""
++	}
++	// «09.2023» — это период, а не номер: месяц слева, год справа
++	if len(head) <= 2 && reYearLike.MatchString(tail) {
++		return ""
++	}
++	if n := plainNumber(head); n != "" {
++		return n + "." + tail
++	}
++	return ""
++}
++
++// isDatePart — слово является частью даты: перед ним стоит предлог «от», либо
++// сразу за ним идёт название месяца («от 11 Августа 2023 г.»).
++var reMonthWord = regexp.MustCompile(`(?i)^(январ|феврал|март|апрел|мая|май|июн|июл|август|сентябр|октябр|ноябр|декабр)`)
++
++func isDatePart(r tokenRow, at int) bool {
++	if at > 0 {
++		prev := strings.ToLower(strings.TrimSpace(r.Toks[at-1].Text))
++		if prev == "от" || prev == "за" {
++			return true
++		}
++	}
++	if at+1 < len(r.Toks) && reMonthWord.MatchString(strings.TrimSpace(r.Toks[at+1].Text)) {
++		return true
++	}
++	return false
++}
++
++// afterPlaceWord — перед словом стоит указатель места: дом, помещение, квартира,
++// офис, кабинет, корпус. Их номера не имеют отношения к номеру документа.
++var rePlaceWord = regexp.MustCompile(`(?i)^(дом|д\.|пом|помещени|кв|квартир|оф|офис|каб|кабинет|корп|корпус|стр|строени|этаж|бл|блок)`)
++
++func afterPlaceWord(r tokenRow, at int) bool {
++	if at == 0 {
++		return false
++	}
++	return rePlaceWord.MatchString(strings.TrimSpace(r.Toks[at-1].Text))
++}
+diff --git a/docflow/internal/recognize/headernum_guard_test.go b/docflow/internal/recognize/headernum_guard_test.go
+new file mode 100644
+index 0000000..b518c2d
+--- /dev/null
++++ b/docflow/internal/recognize/headernum_guard_test.go
+@@ -0,0 +1,61 @@
++package recognize
++
++import (
++	"strings"
++	"testing"
++)
++
++// Номер документа: чужой номер хуже пустого поля.
++//
++// Сценарии взяты из разбора 14.09 — каждый был проверен прогоном «до/после» и
++// каждый портил поле номера после правок 13.09.
++
++// headerLine собирает строку из слов, раскладывая их по горизонтали подряд.
++func headerLine(text string) []wordBox {
++	var out []wordBox
++	x := 100.0
++	for _, w := range strings.Fields(text) {
++		width := float64(len([]rune(w))) * 12
++		out = append(out, wb(w, x, 100, width))
++		x += width + 12
++	}
++	// без второй строки разбор не состоится: нужен хотя бы ещё один ряд
++	out = append(out, wb("Исполнитель", 100, 200, 120))
++	out = append(out, wb("ООО", 240, 200, 40))
++	return out
++}
++
++func TestHeaderNumberNotTaken(t *testing.T) {
++	cases := map[string]string{
++		"день из даты":             "СЧЕТ-ФАКТУРА от 11 Августа 2023 г.",
++		"день из даты, акт":        "АКТ от 11 августа 2023 года",
++		"номер чужого счёта":       "Акт выполненных работ к счету № 45",
++		"номер чужой накладной":    "Акт приема товара к накладной № 771",
++		"номер спецификации":       "Акт сдачи-приемки согласно спецификации № 3",
++		"номер договора за фразой": "Акт выполненных работ по договору аренды от 01.03.2022г. №42",
++		"пометка б/н":              "Акт выполненных работ б/н от 30.09.2023",
++		"год с буквой":             "АКТ выполненных работ от 2024г.",
++		"период вместо номера":     "АКТ за период 09.2023",
++	}
++	for name, line := range cases {
++		got := HeaderNumberFromWords(headerLine(line))
++		if got != "" {
++			t.Errorf("%s: в поле номера уехало %q из строки %q — чужой номер хуже пустого поля", name, got, line)
++		}
++	}
++}
++
++func TestHeaderNumberTaken(t *testing.T) {
++	cases := map[string]struct{ line, want string }{
++		"серия буквами":        {"АКТ оказанных услуг № АП4531279 от 14.09.2023", "АП4531279"},
++		"месяц словами рядом":  {"Счет-фактура № 85906 от 11 Августа 2023 г.", "85906"},
++		"договор как документ": {"Договор оказания услуг № А769у от 22 августа 2023 г.", "А769у"},
++		"составное название":   {"Счет-акт на оплату аренды № А0000000860", "А0000000860"},
++	}
++	for name, c := range cases {
++		got := HeaderNumberFromWords(headerLine(c.line))
++		if got != c.want {
++			t.Errorf("%s: получено %q, ожидалось %q (строка %q)", name, got, c.want, c.line)
++		}
++	}
++}
+diff --git a/docflow/internal/recognize/headernum_real_test.go b/docflow/internal/recognize/headernum_real_test.go
+new file mode 100644
+index 0000000..ebc5bf0
+--- /dev/null
++++ b/docflow/internal/recognize/headernum_real_test.go
+@@ -0,0 +1,224 @@
++package recognize
++
++import (
++	"testing"
++)
++
++// Номер документа на НАСТОЯЩИХ раскладках.
++//
++// Тест на одной идеальной строке не ловит ошибок раскладки. Здесь
++// берутся слова с координатами реальных документов, и сценарий строится ПРАВКОЙ
++// этих слов на их же местах: геометрия бланка остаётся настоящей.
++
++type placed struct {
++	text   string
++	x0, x1 float64
++}
++
++// rowOf — слова строки, в которой стоит слово anchor (по пересечению по вертикали).
++func rowBounds(ws []wordBox, anchor string) (y0, y1 float64, ok bool) {
++	for _, w := range ws {
++		if w.Text == anchor {
++			return w.Y0, w.Y1, true
++		}
++	}
++	return 0, 0, false
++}
++
++func sameRow(w wordBox, y0, y1 float64) bool {
++	c := (w.Y0 + w.Y1) / 2
++	return c >= y0 && c <= y1
++}
++
++// replaceRow убирает строку, где стоит anchor, и кладёт на её место новые слова.
++func replaceRow(t *testing.T, ws []wordBox, anchor string, repl ...placed) []wordBox {
++	t.Helper()
++	y0, y1, ok := rowBounds(ws, anchor)
++	if !ok {
++		t.Fatalf("в раскладке нет слова %q", anchor)
++	}
++	out := make([]wordBox, 0, len(ws)+len(repl))
++	for _, w := range ws {
++		if !sameRow(w, y0, y1) {
++			out = append(out, w)
++		}
++	}
++	for _, p := range repl {
++		out = append(out, wordBox{Text: p.text, X0: p.x0, X1: p.x1, Y0: y0, Y1: y1})
++	}
++	return out
++}
++
++// appendToRow дописывает слова в строку, где стоит anchor.
++func appendToRow(t *testing.T, ws []wordBox, anchor string, add ...placed) []wordBox {
++	t.Helper()
++	y0, y1, ok := rowBounds(ws, anchor)
++	if !ok {
++		t.Fatalf("в раскладке нет слова %q", anchor)
++	}
++	out := append([]wordBox{}, ws...)
++	for _, p := range add {
++		out = append(out, wordBox{Text: p.text, X0: p.x0, X1: p.x1, Y0: y0, Y1: y1})
++	}
++	return out
++}
++
++func TestRealHeader126(t *testing.T) {
++	base := func() []wordBox { return loadWordsTSV(t, "testdata/header-126-words.tsv") }
++
++	t.Run("как есть: номер акта, а не договора", func(t *testing.T) {
++		if got := HeaderNumberFromWords(base()); got != "У-000484" {
++			t.Errorf("получено %q, ожидалось У-000484 — выиграл номер договора строкой ниже", got)
++		}
++	})
++
++	t.Run("акт б/н: номер договора чужой", func(t *testing.T) {
++		ws := replaceRow(t, base(), "сдачи-приемки",
++			placed{"сдачи-приемки", 998, 1290}, placed{"выполненных", 1313, 1560},
++			placed{"работ", 1583, 1695}, placed{"б/н", 1718, 1780})
++		if got := HeaderNumberFromWords(ws); got != "" {
++			t.Errorf("акт без номера получил %q — это номер договора, чужой номер хуже пустого поля", got)
++		}
++	})
++
++	t.Run("акт без номера вовсе: номер договора чужой", func(t *testing.T) {
++		ws := replaceRow(t, base(), "сдачи-приемки",
++			placed{"выполненных", 1000, 1250}, placed{"работ", 1270, 1380},
++			placed{"за", 1400, 1440}, placed{"сентябрь", 1460, 1640}, placed{"2023", 1660, 1740})
++		if got := HeaderNumberFromWords(ws); got != "" {
++			t.Errorf("акт без номера получил %q — это номер договора", got)
++		}
++	})
++
++	t.Run("б/н в строке названия, помещение под ним", func(t *testing.T) {
++		ws := appendToRow(t, base(), "AKT",
++			placed{"№", 1350, 1370}, placed{"б/н", 1380, 1440},
++			placed{"от", 1460, 1500}, placed{"30.09.2023", 1520, 1700})
++		ws = replaceRow(t, ws, "сдачи-приемки",
++			placed{"Помещение", 1000, 1200}, placed{"№", 1210, 1235}, placed{"5", 1290, 1320})
++		if got := HeaderNumberFromWords(ws); got != "" {
++			t.Errorf("получено %q — номер помещения под актом б/н", got)
++		}
++	})
++
++	t.Run("перенос: «по договору» в строке названия, номер под ним", func(t *testing.T) {
++		ws := appendToRow(t, base(), "AKT",
++			placed{"выполненных", 1350, 1590}, placed{"работ", 1610, 1720},
++			placed{"по", 1740, 1790}, placed{"договору", 1810, 1990})
++		ws = replaceRow(t, ws, "сдачи-приемки",
++			placed{"аренды", 1000, 1150}, placed{"№", 1170, 1195}, placed{"42", 1215, 1260},
++			placed{"от", 1280, 1320}, placed{"01.03.2022", 1340, 1520})
++		if got := HeaderNumberFromWords(ws); got != "" {
++			t.Errorf("получено %q — номер договора с перенесённой строки", got)
++		}
++	})
++
++	t.Run("перенос: «к» в конце строки названия", func(t *testing.T) {
++		ws := appendToRow(t, base(), "AKT",
++			placed{"выполненных", 1350, 1590}, placed{"работ", 1610, 1720}, placed{"к", 1740, 1760})
++		ws = replaceRow(t, ws, "сдачи-приемки",
++			placed{"№", 1000, 1025}, placed{"45", 1045, 1090},
++			placed{"от", 1110, 1150}, placed{"01.03.2022", 1170, 1350})
++		if got := HeaderNumberFromWords(ws); got != "" {
++			t.Errorf("получено %q — номер чужого документа («к № 45»)", got)
++		}
++	})
++
++	t.Run("латинская c в «cчету»", func(t *testing.T) {
++		ws := appendToRow(t, base(), "AKT",
++			placed{"выполненных", 1350, 1590}, placed{"работ", 1610, 1720}, placed{"по", 1740, 1780},
++			placed{"cчету", 1800, 1920}, placed{"№", 1940, 1965}, placed{"45", 1985, 2030})
++		ws = replaceRow(t, ws, "сдачи-приемки", placed{"аренды", 1000, 1150})
++		if got := HeaderNumberFromWords(ws); got != "" {
++			t.Errorf("получено %q — латинская буква в слове-владельце вернула чужой номер", got)
++		}
++	})
++}
++
++func TestRealHeader218(t *testing.T) {
++	base := func() []wordBox { return loadWordsTSV(t, "testdata/header-218-words.tsv") }
++
++	t.Run("как есть", func(t *testing.T) {
++		if got := HeaderNumberFromWords(base()); got != "118" {
++			t.Errorf("получено %q, ожидалось 118", got)
++		}
++	})
++
++	// Номер под названием в той же строке, что и банк слева. Ветка «заголовок в
++	// две строки» шла раньше проверки по вертикали и брала «№ 527» из банка.
++	moved := func(t *testing.T, left ...placed) []wordBox {
++		ws := replaceRow(t, base(), `"Минсктранс"`, placed{`"Минсктранс"`, 460, 626})
++		return replaceRow(t, ws, `"Троллейбусный`, append(left, placed{"118", 2020, 2072})...)
++	}
++
++	t.Run("банк слева на строке номера", func(t *testing.T) {
++		ws := moved(t, placed{"Банк:", 664, 740}, placed{"ЦБУ", 755, 810}, placed{"№", 825, 850},
++			placed{"527", 865, 915}, placed{"ОАО", 930, 980}, placed{"«Беларусбанк»", 995, 1190})
++		if got := HeaderNumberFromWords(ws); got != "118" {
++			t.Errorf("получено %q, ожидалось 118 — номер взят из реквизитов банка", got)
++		}
++	})
++
++	t.Run("адрес слева на строке номера", func(t *testing.T) {
++		ws := moved(t, placed{"Адрес:", 664, 760}, placed{"220030", 775, 870},
++			placed{"г.", 885, 905}, placed{"Минск", 920, 1010})
++		if got := HeaderNumberFromWords(ws); got != "118" {
++			t.Errorf("получено %q, ожидалось 118 — номер взят из адреса", got)
++		}
++	})
++}
++
++// Договор: слово «акт» в теле договора не делает его актом.
++func TestContractBodyActWord(t *testing.T) {
++	ws := []wordBox{
++		wb("ДОГОВОР", 900, 100, 80), wb("№", 990, 100, 10), wb("25", 1005, 100, 20),
++		wb("г.", 300, 130, 15), wb("Минск", 330, 130, 50), wb("01.03.2023", 1500, 130, 80),
++		wb("1.", 300, 160, 15), wb("Предмет", 330, 160, 70), wb("договора", 420, 160, 70),
++		wb("Акт", 900, 190, 30), wb("сдачи-приемки", 940, 190, 120), wb("подписывается", 1070, 190, 120), wb("сторонами", 1200, 190, 90),
++		wb("5", 905, 220, 10), wb("дней", 920, 220, 40),
++	}
++	if got := HeaderNumberFromWords(ws); got != "25" {
++		t.Errorf("получено %q, ожидалось 25 — номер взят из текста договора", got)
++	}
++}
++
++// Одинокое «АКТ», под ним адрес: индекс — не номер.
++func TestLoneActPostalCode(t *testing.T) {
++	ws := []wordBox{
++		wb("АКТ", 900, 100, 40),
++		wb("220030", 890, 130, 60), wb("г.", 960, 130, 15), wb("Минск", 985, 130, 50), wb("ул.", 1045, 130, 25), wb("Пинская", 1080, 130, 70),
++		wb("Исполнитель", 100, 200, 120), wb("ООО", 240, 200, 40),
++	}
++	if got := HeaderNumberFromWords(ws); got != "" {
++		t.Errorf("получено %q — почтовый индекс под названием", got)
++	}
++}
++
++// «ООО» под названием распознано цифрами — не номер.
++func TestZerosFromCompanyForm(t *testing.T) {
++	ws := []wordBox{
++		wb("АКТ", 900, 100, 40),
++		wb("000", 890, 130, 60), wb("\"Ромашка\"", 960, 130, 140),
++		wb("Исполнитель", 100, 200, 120), wb("ООО", 240, 200, 40),
++	}
++	if got := HeaderNumberFromWords(ws); got != "" {
++		t.Errorf("получено %q — это «ООО», прочитанное цифрами", got)
++	}
++}
++
++// Документы, где номер сверен со сканом (14.09): страховка от повтора ошибок
++// поиска номера на этих раскладках.
++func TestRealHeaderCheckedByScan(t *testing.T) {
++	cases := []struct{ file, want, why string }{
++		// на бумаге «1333337», распознавание прочитало с лишней тройкой — место номера верное
++		{"testdata/header-0001-words.tsv", "13333337", "номер под штрихкодом, один в строке; «000» из «ООО» — не номер"},
++		{"testdata/header-0153-words.tsv", "27-09/23", "номер акта с разными разделителями — не дата, и не номер договора ниже"},
++		{"testdata/header-0161-words.tsv", "810", "знак «№» в конце строки названия, номер унесён на строку ниже"},
++		{"testdata/header-0217-words.tsv", "", "на бумаге «счёт-фактура № б/н»"},
++	}
++	for _, c := range cases {
++		if got := HeaderNumberFromWords(loadWordsTSV(t, c.file)); got != c.want {
++			t.Errorf("%s: получено %q, на скане %q — %s", c.file, got, c.want, c.why)
++		}
++	}
++}
+diff --git a/docflow/internal/recognize/minors_test.go b/docflow/internal/recognize/minors_test.go
+new file mode 100644
+index 0000000..76c71a5
+--- /dev/null
++++ b/docflow/internal/recognize/minors_test.go
+@@ -0,0 +1,103 @@
++package recognize
++
++import (
++	"math"
++	"testing"
++
++	"docflow/internal/domain"
++)
++
++// Пограничные случаи номера документа и строки итога.
++
++// «бланков», «формированию» — это не слово-владелец чужого номера. Владелец —
++// только «Форма № 868» / «бланк № 5», когда слово стоит прямо перед знаком.
++func TestFormWordDoesNotWipeOwnNumber(t *testing.T) {
++	cases := map[string]struct{ line, want string }{
++		"акт списания бланков":    {"АКТ списания бланков строгой отчетности № 12", "12"},
++		"формирование отчётности": {"Акт оказания услуг по формированию отчетности № 15", "15"},
++		"бланк не перед знаком":   {"Акт списания бланка строгой отчетности № 12", "12"},
++		"номер бланка — не номер": {"АКТ Форма № 868", ""},
++		"номер формы без пробела": {"АКТ Форма №868", ""},
++	}
++	for name, c := range cases {
++		if got := HeaderNumberFromWords(headerLine(c.line)); got != c.want {
++			t.Errorf("%s: получено %q, ожидалось %q (строка %q)", name, got, c.want, c.line)
++		}
++	}
++}
++
++// «Лицевой счет № 123456» — реквизит, а не название документа.
++func TestPersonalAccountIsNotTitle(t *testing.T) {
++	ws := []wordBox{
++		wb("Лицевой", 100, 100, 80), wb("счет", 190, 100, 45), wb("№", 245, 100, 12), wb("123456", 265, 100, 70),
++		wb("АКТ", 900, 140, 40), wb("№", 950, 140, 12), wb("12", 970, 140, 20), wb("от", 1000, 140, 20), wb("30.09.2023", 1030, 140, 90),
++	}
++	if got := HeaderNumberFromWords(ws); got != "12" {
++		t.Errorf("получено %q, ожидалось 12 — лицевой счёт принят за название документа", got)
++	}
++}
++
++// Дата в строке «Всего по счёту от 14.09.2026» — не деньги: Totals не занят, и
++// изуродованный итог должен быть забран.
++func TestDateIsNotMoneyInTotals(t *testing.T) {
++	cols := []string{"Наименование", "Сумма", "НДС", "Всего"}
++	ft := &domain.FreeTable{
++		Columns: cols,
++		Roles:   rolesFor(cols),
++		Totals:  []string{"Всего по счёту от 14.09.2026"},
++		Rows: [][]string{
++			{"Вода", "10,00", "2,00", "12,00"},
++			{"Стоки", "20,65", "4,13", "24,78"},
++			{"ИТ0ГО", "30,65", "6,13", "36,78"},
++		},
++	}
++	takeGarbledTotalsRow(ft)
++	if len(ft.Rows) != 2 {
++		t.Errorf("дата в итоге сочтена деньгами, итог остался позицией: %q", ft.Rows)
++	}
++}
++
++// Роли не определены: графы № и количества складываются «бесплатно» (3 = 1 + 2,
++// 2 = 1 + 1). Неизвестная графа считается денежной, только если в этой строке
++// сумма написана деньгами.
++func TestUnknownRolesJudgeByContent(t *testing.T) {
++	ft := &domain.FreeTable{
++		Rows: [][]string{
++			{"1", "Товар А", "1", "45,00", "45,00"},
++			{"2", "Товар Б", "1", "45,00", "45,00"},
++			{"3", "Товар В", "2", "45,00", "90,00"},
++		},
++	}
++	takeGarbledTotalsRow(ft)
++	if len(ft.Rows) != 3 {
++		t.Errorf("позиция съедена через графы № и количества: %q", ft.Rows)
++	}
++}
++
++// Двойной сдвиг: слово, опустившееся после поправки в следующую полосу, не
++// должно получить вторую поправку. Лист с наклоном в «обратную» сторону
++// (k < 0) — поправка опускает слова.
++func TestDeskewNoDoubleShift(t *testing.T) {
++	// «верх» и «низ» стоят у левого края (поправка им ноль) и задают полосы
++	// [100, 260) и [260, 420): без «низа» вторая полоса не обрабатывается вовсе,
++	// и двойной сдвиг проверить нечем.
++	toks := []token{
++		{Text: "верх", X0: 0, X1: 60, Y0: 100, Y1: 120},
++		{Text: "низ", X0: 0, X1: 60, Y0: 400, Y1: 420},
++	}
++	const k = -0.03
++	for x := 400.0; x <= 2000; x += 100 {
++		y := 270 + k*x // 258 … 210: вся строка в первой полосе, после поправки — 270, во второй
++		toks = append(toks, token{Text: "w", X0: x, X1: x + 60, Y0: y, Y1: y + 20})
++	}
++	out := deskewTokens(toks)
++	for i, t2 := range out {
++		if t2.Text != "w" {
++			continue
++		}
++		if math.Abs(t2.Y0-270) > 1 {
++			t.Fatalf("слово %d (x=%.0f) после поправки на y=%.1f, ожидалось 270 — сдвинуто дважды или не выпрямлено",
++				i, t2.X0, t2.Y0)
++		}
++	}
++}
+diff --git a/docflow/internal/recognize/skew_test.go b/docflow/internal/recognize/skew_test.go
+new file mode 100644
+index 0000000..9f12510
+--- /dev/null
++++ b/docflow/internal/recognize/skew_test.go
+@@ -0,0 +1,61 @@
++package recognize
++
++import (
++	"strings"
++	"testing"
++)
++
++// Перекос впечатанных данных.
++//
++// Лист ровный, а данные съехали: наклон по всей странице ноль, в табличной зоне
++// 0.024-0.031. Строка уходит вниз на две-три высоты слова, пока идёт слева
++// направо, и сборка строк по перекрытию боксов рвёт её на куски: значения
++// позиции разъезжаются, а в саму позицию встают обломки шапки.
++//
++// Тест проверяемый: без поправки эта позиция собирается как
++// « | | ШТ | 1,000 | | BYN | НДС, % | BYN | » — то есть без единой суммы.
++func TestSkewedPositionKeepsItsAmounts(t *testing.T) {
++	ft := TableFromWords(loadWordsTSV(t, "testdata/skew-126-words.tsv"))
++	if ft == nil {
++		t.Fatal("таблица не собрана")
++	}
++	if len(ft.Rows) == 0 {
++		t.Fatal("позиций нет — значения ушли в шапку")
++	}
++	joined := strings.Join(ft.Rows[0], " | ")
++	// цена, стоимость, НДС и всего с НДС — на документе это одна позиция
++	for _, want := range []string{"8,33", "1,67", "10,00"} {
++		if !strings.Contains(joined, want) {
++			t.Errorf("в позиции нет суммы %s (строка: %q) — значения разъехались по соседним строкам", want, joined)
++		}
++	}
++	// в графы значений не должны попадать обломки подписей граф
++	for _, junk := range []string{"BYN", "НДС, %"} {
++		if strings.Contains(joined, junk) {
++			t.Errorf("в позицию затесался обломок шапки %q: %q", junk, joined)
++		}
++	}
++}
++
++// Строка «Итого», не опознанная по слову.
++//
++// Распознавание отдаёт «ОТОТИ» вместо «ИТОГО», строка итога остаётся в позициях,
++// и сумма позиций становится вдвое больше настоящей: 95,48 вместо 47,74.
++// Внешне таблица выглядит разобранной — в 1С уходит удвоенный документ.
++func TestGarbledTotalsRowGoesToTotals(t *testing.T) {
++	ft := TableFromWords(loadWordsTSV(t, "testdata/market-invoice-words.tsv"))
++	if ft == nil {
++		t.Fatal("таблица не собрана")
++	}
++	if len(ft.Totals) == 0 {
++		t.Fatal("строка итога не выделена — останется в позициях и удвоит сумму")
++	}
++	if !strings.Contains(strings.Join(ft.Totals, " "), "47,74") {
++		t.Errorf("в итоге нет суммы документа 47,74: %q", strings.Join(ft.Totals, " "))
++	}
++	for i, r := range ft.Rows {
++		if strings.Contains(strings.Join(r, " "), "47,74") {
++			t.Errorf("строка %d осталась в позициях с итогом документа: %q", i, strings.Join(r, " | "))
++		}
++	}
++}
+diff --git a/docflow/internal/recognize/testdata/header-0001-words.tsv b/docflow/internal/recognize/testdata/header-0001-words.tsv
+new file mode 100644
+index 0000000..f955982
+--- /dev/null
++++ b/docflow/internal/recognize/testdata/header-0001-words.tsv
+@@ -0,0 +1,463 @@
++x0	y0	x1	y1	text
++307.0	117.0	349.3	133.0	Для
++363.4	117.0	462.2	133.0	выписки
++476.3	117.0	504.5	133.0	на
++518.6	117.0	575.0	133.0	ПЭВМ
++1980.0	122.0	2047.4	136.0	Форма
++2060.8	122.0	2209.0	136.0	установлена
++362.0	154.0	374.3	168.0	с
++386.5	154.0	521.3	168.0	соблюдением
++533.6	154.0	582.6	168.0	всех
++594.9	154.0	717.5	168.0	реквизитов
++729.7	154.0	791.0	168.0	формы
++1968.0	155.0	2161.0	167.0	постановлением
++2002.0	187.0	2167.7	205.0	Министерства
++2181.5	187.0	2292.0	205.0	финансов
++329.0	194.0	365.9	212.0	1-й
++378.2	194.0	427.5	212.0	экз.
++439.8	194.0	452.1	212.0	—
++464.4	194.0	649.0	212.0	грузополучателю
++1127.0	207.0	1316.0	222.0	Грузоотправитель
++1532.0	208.0	1715.0	225.0	Грузополучатель
++1989.0	221.0	2120.1	237.0	Республики
++2133.2	221.0	2238.0	237.0	Беларусь
++330.0	229.0	367.2	243.0	2-й
++379.6	229.0	429.3	243.0	экз.
++441.7	229.0	454.1	243.0	—
++466.5	229.0	665.0	243.0	грузоотправителю
++948.0	248.0	1002.0	260.0	УНП
++1146.0	246.0	1277.0	262.0	590712866
++1547.0	247.0	1674.0	262.0	590888079
++1967.0	252.0	2089.7	266.0	30.06.2016
++2101.9	252.0	2114.2	266.0	№
++2126.5	252.0	2151.0	266.0	58
++252.0	393.0	328.2	411.0	Серия
++343.5	393.0	374.0	411.0	ДЯ
++607.0	479.0	843.0	507.0	ТОВАРНАЯ
++872.5	479.0	1138.0	507.0	НАКЛАДНАЯ
++1462.0	531.0	1647.0	552.0	13333337
++618.0	626.0	643.9	640.0	25
++656.8	626.0	708.5	640.0	Июля
++721.5	626.0	773.2	640.0	2023
++786.1	626.0	812.0	640.0	г.
++751.0	669.0	792.3	689.0	000
++806.1	669.0	985.0	689.0	"ЭЛЬМАТРЕЙД",
++998.8	669.0	1109.0	689.0	г.Гродно
++1122.7	669.0	1274.2	689.0	ул.Горького
++1287.9	669.0	1343.0	689.0	87/1
++224.0	673.0	405.0	686.0	рузоотправитель
++820.0	713.0	959.3	727.0	(наименование,
++969.3	713.0	1029.0	727.0	адрес)
++218.0	753.0	390.0	766.0	рузополучатель
++771.0	750.0	797.8	768.0	ООО
++806.8	750.0	905.1	768.0	"КофеВенд",
++914.0	750.0	967.7	768.0	220002
++976.6	750.0	1039.2	768.0	г.Минск
++1048.1	750.0	1074.9	768.0	ул,
++1083.9	750.0	1191.1	768.0	Сторожевская
++1200.1	750.0	1209.0	768.0	8
++819.0	793.0	959.0	807.0	(наименование,
++969.0	793.0	1029.0	807.0	адрес)
++227.0	831.0	332.9	844.0	Эснование
++344.6	831.0	427.0	844.0	отпуска
++653.0	829.0	738.4	844.0	Договор
++750.6	829.0	811.6	844.0	18/05
++823.8	829.0	848.2	844.0	от
++860.4	829.0	958.0	844.0	18.05.23
++877.0	874.0	1016.6	888.0	(наименование,
++1026.6	874.0	1066.5	888.0	дата
++1076.5	874.0	1086.4	888.0	и
++1096.4	874.0	1146.3	888.0	номер
++1156.3	874.0	1256.0	888.0	документа)
++1160.0	909.0	1175.1	926.0	І
++1190.2	909.0	1311.2	926.0	ТОВАРНЫЙ
++1326.3	909.0	1417.0	926.0	РАЗДЕЛ
++1252.0	950.0	1322.0	964.0	Стои-
++782.0	954.0	861.0	968.0	Единица
++1389.0	954.0	1459.0	967.0	Ставка
++1531.0	952.0	1609.0	966.0	Сумма
++1694.0	952.0	1812.0	967.0	Стоимость
++917.0	965.0	993.0	983.0	Коли-
++1080.0	967.0	1144.0	981.0	Цена.
++371.0	986.0	516.3	1000.0	Наименование
++528.4	986.0	601.0	1000.0	товара
++784.0	988.0	853.0	1001.0	измере
++1246.0	989.0	1324.0	1001.0	мость,
++1392.0	987.0	1450.0	1001.0	НДС,
++1535.0	987.0	1599.0	1002.0	НДС,
++1704.0	988.0	1717.2	1003.0	с
++1730.3	988.0	1783.0	1003.0	НДС,
++2040.0	988.0	2177.0	1004.0	Примечание
++920.0	1005.0	994.0	1018.0	чество
++1067.0	1004.0	1110.6	1019.0	руб.
++1121.4	1004.0	1165.0	1019.0	коп.
++797.0	1022.0	839.0	1033.0	RNH
++1239.0	1024.0	1280.8	1038.0	руб.
++1291.2	1024.0	1333.0	1038.0	коп.
++1409.0	1021.0	1434.0	1033.0	00
++1521.0	1024.0	1564.1	1039.0	руб.
++1574.9	1024.0	1618.0	1039.0	коп.
++1696.0	1025.0	1739.1	1039.0	руб.
++1749.9	1025.0	1793.0	1039.0	коп.
++383.0	1059.0	394.0	1070.0	1
++805.0	1059.0	817.0	1072.0	2
++939.0	1059.0	955.0	1074.0	3
++1096.0	1060.0	1112.0	1072.0	4
++1269.0	1060.0	1285.0	1074.0	5
++1409.0	1060.0	1423.0	1074.0	6
++1726.0	1062.0	1742.0	1075.0	8
++2077.0	1061.0	2093.0	1075.0	9
++344.0	1106.0	471.6	1125.0	Вкладыши
++487.6	1106.0	615.2	1125.0	коренные
++631.1	1106.0	679.0	1125.0	STD
++764.0	1105.0	801.0	1120.0	шт
++1116.0	1104.0	1188.0	1120.0	70.99
++1290.0	1104.0	1359.0	1119.0	70.99
++1396.0	1104.0	1440.0	1118.0	Без
++1876.0	1106.0	1942.6	1123.0	70.99
++1955.9	1106.0	2009.2	1123.0	Цена
++2022.6	1106.0	2329.0	1123.0	импортера/производителя
++1398.0	1137.0	1448.0	1152.0	ндс
++323.0	1146.0	428.4	1164.0	Артикул
++443.4	1146.0	548.8	1164.0	H1065/5
++563.8	1146.0	609.0	1164.0	STD
++1929.0	1143.0	1989.6	1159.0	45.80
++2001.7	1143.0	2062.2	1159.0	руб.;
++2074.3	1143.0	2256.0	1159.0	оптова/торговая
++1878.0	1180.0	1995.3	1194.0	надбавка
++2010.0	1180.0	2054.0	1194.0	35%
++309.0	1214.0	419.1	1230.0	28х42х5
++434.9	1214.0	545.0	1230.0	Сальник
++767.0	1215.0	801.0	1229.0	ШT
++1118.0	1214.0	1190.0	1231.0	14.10
++1291.0	1214.0	1361.0	1229.0	14.10
++1396.0	1215.0	1440.0	1228.0	Без
++1878.0	1218.0	1944.6	1235.0	14.10
++1957.9	1218.0	2011.2	1235.0	Цена
++2024.6	1218.0	2331.0	1235.0	импортера/производителя
++1397.0	1247.0	1450.0	1262.0	НДС
++1926.0	1255.0	1974.6	1271.0	9.10
++1986.8	1255.0	2047.5	1271.0	руб.;
++2059.7	1255.0	2242.0	1271.0	оптова/торговая
++330.0	1261.0	488.2	1277.0	распредвала
++502.6	1261.0	517.0	1277.0	.
++531.3	1261.0	632.0	1277.0	Артикул
++1892.0	1290.0	2003.5	1305.0	надбавка
++2017.4	1290.0	2101.0	1305.0	34.95%
++265.0	1298.0	374.0	1313.0	073.890
++767.0	1341.0	801.0	1354.0	WT
++1118.0	1339.0	1188.0	1356.0	16.35
++1290.0	1339.0	1366.0	1356.0	16.35
++1393.0	1339.0	1442.0	1354.0	Без
++327.0	1344.0	460.6	1361.0	прокладка
++475.5	1344.0	624.0	1361.0	коллектора
++1878.0	1342.0	1944.3	1361.0	16.35
++1957.6	1342.0	2010.6	1361.0	Цена
++2023.9	1342.0	2329.0	1361.0	импортера/производителя
++1397.0	1371.0	1452.0	1388.0	НДС
++1929.0	1379.0	1989.9	1396.0	10.55
++2002.1	1379.0	2063.0	1396.0	руб.;
++2075.2	1379.0	2258.0	1396.0	оптова/торговая
++357.0	1383.0	493.4	1401.0	выпускного
++507.1	1383.0	520.7	1401.0	.
++534.4	1383.0	629.9	1401.0	Артикул
++643.5	1383.0	739.0	1401.0	332.280
++1890.0	1415.0	2001.5	1430.0	надбавка
++2015.4	1415.0	2099.0	1430.0	34.98%
++1115.0	1450.0	1184.0	1467.0	26.81
++1289.0	1450.0	1359.0	1465.0	26.81
++329.0	1454.0	469.7	1471.0	Прокладка
++485.3	1454.0	626.0	1471.0	клапанной
++767.0	1454.0	801.0	1466.0	ШT
++1397.0	1451.0	1442.0	1466.0	Без
++1878.0	1453.0	1944.3	1472.0	26.81
++1957.6	1453.0	2010.6	1472.0	Цена
++2023.9	1453.0	2329.0	1472.0	импортера/производителя
++1397.0	1482.0	1452.0	1499.0	ндс
++343.0	1494.0	427.8	1512.0	крышки
++441.9	1494.0	456.0	1512.0	.
++470.1	1494.0	569.0	1512.0	Артикул
++583.1	1494.0	682.0	1512.0	332.500
++1930.0	1492.0	1990.7	1509.0	17.30
++2002.9	1492.0	2039.3	1509.0	руб
++2051.5	1492.0	2063.6	1509.0	;
++2075.8	1492.0	2258.0	1509.0	оптова/торговая
++1891.0	1526.0	2004.1	1543.0	надбавка
++2018.2	1526.0	2103.0	1543.0	34.97%
++340.0	1565.0	468.7	1584.0	прокладка
++483.0	1565.0	526.0	1584.0	ГБЦ
++540.3	1565.0	554.6	1584.0	.
++568.9	1565.0	669.0	1584.0	Артикул
++1116.0	1564.0	1186.0	1580.0	82.85
++1290.0	1562.0	1366.0	1579.0	82.85
++766.0	1566.0	803.0	1579.0	ШТ
++1395.0	1564.0	1444.0	1583.0	Без
++1875.0	1566.0	1941.8	1585.0	82.85
++1955.1	1566.0	2008.5	1585.0	Цена
++2021.9	1566.0	2329.0	1585.0	импортера/производителя
++1399.0	1593.0	1452.0	1610.0	ндс
++264.0	1605.0	372.0	1619.0	688,422
++1929.0	1604.0	1990.3	1620.0	53.45
++2002.6	1604.0	2063.9	1620.0	руб.;
++2076.1	1604.0	2260.0	1620.0	оптова/торговая
++1879.0	1639.0	1995.7	1653.0	надбавка
++2010.2	1639.0	2054.0	1653.0	35%
++328.0	1677.0	463.9	1693.0	Прокладка
++479.1	1677.0	615.0	1693.0	масляного
++766.0	1677.0	799.0	1689.0	ШТ
++1115.0	1674.0	1184.0	1689.0	89.28
++1289.0	1674.0	1359.0	1689.0	89.28
++1397.0	1675.0	1442.0	1688.0	Без
++1876.0	1676.0	1942.3	1695.0	89.28
++1955.6	1676.0	2008.6	1695.0	Цена
++2021.9	1676.0	2327.0	1695.0	импортера/производителя
++1399.0	1705.0	1452.0	1722.0	ндс
++1929.0	1714.0	1990.3	1731.0	57.60
++2002.6	1714.0	2063.9	1731.0	руб.;
++2076.1	1714.0	2260.0	1731.0	оптова/торговая
++345.0	1718.0	451.8	1735.0	поддона
++467.1	1718.0	573.9	1735.0	Артикул
++589.2	1718.0	696.0	1735.0	380.960
++1880.0	1748.0	1997.3	1765.0	надбавка
++2012.0	1748.0	2056.0	1765.0	35%
++765.0	1785.0	801.0	1800.0	шт
++1117.0	1786.0	1186.0	1801.0	22.15
++1289.0	1785.0	1361.0	1801.0	22.15
++1397.0	1785.0	1444.0	1798.0	Без
++343.0	1789.0	468.0	1806.0	Герметик
++483.6	1789.0	671.0	1806.0	прокладочный
++1876.0	1787.0	1942.6	1805.0	22.15
++1955.9	1787.0	2009.2	1805.0	Цена
++2022.6	1787.0	2329.0	1805.0	импортера/производителя
++1398.0	1817.0	1450.0	1832.0	НДС
++323.0	1829.0	391.1	1846.0	серый
++404.7	1829.0	445.6	1846.0	70М
++459.2	1829.0	500.0	1846.0	...
++513.7	1829.0	609.0	1846.0	Артикул
++1931.0	1826.0	1991.9	1842.0	14.29
++2004.1	1826.0	2065.0	1842.0	руб.;
++2077.2	1826.0	2260.0	1842.0	оптова/торговая
++1892.0	1860.0	2003.5	1877.0	надбавка
++2017.4	1860.0	2101.0	1877.0	34.99%
++283.0	1868.0	448.0	1885.0	70-31414-10
++766.0	1911.0	803.0	1925.0	ШТ
++1118.0	1911.0	1190.0	1927.0	37.65
++1290.0	1910.0	1364.0	1926.0	37.65
++1397.0	1910.0	1442.0	1924.0	Без
++343.0	1914.0	402.5	1931.0	Смазка
++412.4	1914.0	442.1	1931.0	для
++452.0	1914.0	551.2	1931.0	инжекторов
++561.1	1914.0	571.0	1931.0	и
++1878.0	1915.0	1944.6	1932.0	37.65
++1957.9	1915.0	2011.2	1932.0	Цена
++2024.6	1915.0	2331.0	1932.0	импортера/производителя
++1398.0	1943.0	1450.0	1958.0	ндс
++353.0	1954.0	439.8	1972.0	свечей
++454.2	1954.0	613.3	1972.0	накаливания
++627.8	1954.0	729.0	1972.0	(белая)
++1930.0	1951.0	1991.1	1968.0	24.29
++2003.3	1951.0	2064.4	1968.0	руб.;
++2076.7	1951.0	2260.0	1968.0	оптова/торговая
++1890.0	1987.0	2001.5	2002.0	надбавка
++2015.4	1987.0	2099.0	2002.0	34.99%
++317.0	1995.0	374.1	2011.0	50г.
++388.4	1995.0	488.3	2011.0	Артикул
++502.6	1995.0	574.0	2011.0	26712
++351.0	2037.0	421.6	2054.0	Гайка
++435.7	2037.0	562.8	2054.0	выхлопной
++576.9	2037.0	704.0	2054.0	системы:.
++766.0	2037.0	803.0	2051.0	ШТ
++985.0	2036.0	1023.0	2050.0	10
++1130.0	2036.0	1188.0	2051.0	1.03
++1291.0	2035.0	1364.0	2052.0	10.30
++1397.0	2035.0	1442.0	2050.0	Без
++1880.0	2041.0	1946.3	2057.0	10.30
++1959.6	2041.0	2012.6	2057.0	Цена
++2025.9	2041.0	2331.0	2057.0	импортера/производителя
++1398.0	2069.0	1448.0	2084.0	НДС
++1924.0	2076.0	1974.2	2093.0	0.67
++1986.8	2076.0	2037.0	2093.0	руб;
++2049.6	2076.0	2238.0	2093.0	оптова/торговая
++294.0	2080.0	364.0	2097.0	Артикул
++374.0	2080.0	424.0	2097.0	03687
++1889.0	2111.0	2002.1	2126.0	надбавка
++2016.2	2111.0	2101.0	2126.0	34.33%
++167.0	2148.0	200.0	2163.0	10
++337.0	2149.0	430.7	2168.0	Кольца
++446.3	2149.0	586.9	2168.0	поршневые
++602.5	2149.0	665.0	2168.0	1шт.
++764.0	2148.0	803.0	2163.0	ШТ
++1116.0	2146.0	1188.0	2163.0	86.63
++1278.0	2146.0	1364.0	2163.0	346.52
++1396.0	2148.0	1440.0	2161.0	Без
++1864.0	2150.0	1943.7	2166.0	346.52
++1957.0	2150.0	2010.1	2166.0	Цена
++2023.4	2150.0	2329.0	2166.0	импортера/производителя
++1398.0	2180.0	1450.0	2194.0	НДС
++331.0	2190.0	437.1	2207.0	Артикул
++452.2	2190.0	634.0	2207.0	800044510000
++1930.0	2188.0	1991.1	2205.0	55.90
++2003.3	2188.0	2064.4	2205.0	руб.;
++2076.7	2188.0	2260.0	2205.0	оптова/торговая
++1889.0	2222.0	2001.0	2237.0	надбавка
++2015.0	2222.0	2099.0	2237.0	34.97%
++357.0	2260.0	589.0	2278.0	Гидрокомпенсатор
++603.5	2260.0	618.0	2278.0	.
++632.5	2260.0	734.0	2278.0	Артикул
++764.0	2259.0	803.0	2273.0	ШТ
++997.0	2258.0	1008.0	2271.0	8
++1116.0	2259.0	1188.0	2275.0	21.46
++1278.0	2257.0	1359.0	2272.0	171.68
++1398.0	2257.0	1442.0	2271.0	Без
++1867.0	2261.0	1946.5	2279.0	171.68
++1959.8	2261.0	2012.8	2279.0	Цена
++2026.1	2261.0	2331.0	2279.0	импортера/производителя
++1398.0	2291.0	1450.0	2305.0	НДС
++285.0	2300.0	328.4	2316.0	420
++342.8	2300.0	400.6	2316.0	0022
++415.1	2300.0	444.0	2316.0	10
++1932.0	2299.0	1992.7	2315.0	13.85
++2004.9	2299.0	2065.6	2315.0	руб.;
++2077.8	2299.0	2260.0	2315.0	оптова/торговая
++1890.0	2333.0	2003.1	2350.0	надбавка
++2017.2	2333.0	2102.0	2350.0	34.95%
++167.0	2370.0	198.0	2386.0	12
++344.0	2372.0	406.9	2388.0	5W30
++422.6	2372.0	548.5	2388.0	моторное
++564.2	2372.0	642.8	2388.0	масло
++658.5	2372.0	690.0	2388.0	5л
++766.0	2371.0	803.0	2385.0	шт
++998.0	2372.0	1013.0	2385.0	2
++1106.0	2370.0	1194.0	2386.0	133.35
++1278.0	2369.0	1363.0	2384.0	266.70
++1396.0	2369.0	1440.0	2384.0	Без
++1865.0	2373.0	1945.2	2391.0	266.70
++1958.6	2373.0	2012.1	2391.0	Цена
++2025.5	2373.0	2333.0	2391.0	импортера/производителя
++1401.0	2404.0	1454.0	2420.0	ндс
++1930.0	2409.0	1990.7	2426.0	86.03
++2002.9	2409.0	2063.6	2426.0	руб.,
++2075.8	2409.0	2258.0	2426.0	оптова/торговая
++354.0	2413.0	517.3	2431.0	OfficialTech
++530.9	2413.0	626.1	2431.0	Артикул
++639.8	2413.0	735.0	2431.0	65609/5
++1879.0	2445.0	1995.7	2460.0	надбавка
++2010.2	2445.0	2054.0	2460.0	35%
++260.0	2483.0	343.0	2497.0	Итого
++806.0	2486.0	820.0	2501.0	X
++982.0	2483.0	1023.0	2501.0	32
++1268.0	2484.0	1364.0	2501.0	1155.38
++1409.0	2487.0	1423.0	2500.0	X
++1725.0	2484.0	1826.0	2501.0	1155.38
++1098.0	2488.0	1112.0	2500.0	X
++224.0	2529.0	277.1	2543.0	Дены
++290.3	2529.0	423.0	2543.0	розничные.
++215.0	2591.0	279.0	2606.0	Всего
++291.8	2591.0	355.8	2606.0	сумма
++368.6	2591.0	407.0	2606.0	НДС
++2231.0	2596.0	2278.1	2613.0	Без
++2293.9	2596.0	2341.0	2613.0	НДС
++1713.0	2633.0	1822.0	2649.0	(прописью)
++2240.0	2636.0	2337.0	2653.0	(цифрами)
++237.0	2671.0	296.5	2685.0	Всего
++308.4	2671.0	415.6	2685.0	стоимость
++427.5	2671.0	439.4	2685.0	с
++451.3	2671.0	487.0	2685.0	НДС
++1791.0	2676.0	1842.6	2691.0	Одиа
++1855.5	2676.0	1933.0	2691.0	тысяча
++1945.9	2676.0	1984.6	2691.0	сто
++1997.5	2676.0	2113.6	2691.0	пятьдесят
++2126.5	2676.0	2178.1	2691.0	пять
++2191.0	2676.0	2242.7	2691.0	руб.
++2255.6	2676.0	2281.4	2691.0	38
++2294.3	2676.0	2333.0	2691.0	коп
++1712.0	2715.0	1822.0	2728.0	(прописью)
++2242.0	2717.0	2337.0	2732.0	(цифрами)
++219.0	2754.0	291.4	2768.0	Отнуск
++303.5	2754.0	400.0	2768.0	разрешил
++646.0	2751.0	723.3	2766.0	директор,
++731.9	2751.0	792.0	2766.0	Кишкель
++800.6	2751.0	817.8	2766.0	И.
++826.4	2751.0	835.0	2766.0	Ф
++884.0	2793.0	997.1	2810.0	(должность,
++1007.4	2793.0	1089.6	2810.0	фамилия,
++1099.9	2793.0	1192.5	2810.0	инициалы,
++1202.7	2793.0	1285.0	2810.0	подпись)
++236.0	2832.0	283.0	2846.0	Сдал
++294.8	2832.0	483.0	2846.0	грузоотправитель
++732.0	2831.0	849.4	2847.0	менеджер
++864.1	2831.0	893.4	2847.0	по
++908.1	2831.0	1040.2	2847.0	продажам,
++1054.9	2831.0	1186.9	2847.0	Эльяшевич
++1201.6	2831.0	1231.0	2847.0	А.
++1245.6	2831.0	1275.0	2847.0	А.
++988.0	2872.0	1095.6	2887.0	(должность,
++1105.4	2872.0	1183.6	2887.0	фамилия,
++1193.4	2872.0	1281.4	2887.0	инициалы,
++1291.2	2872.0	1369.5	2887.0	поднись;
++1379.2	2872.0	1437.9	2887.0	итами;
++1447.7	2872.0	1525.9	2887.0	(печать)
++1535.7	2872.0	1702.0	2887.0	грузоотправителя)
++244.0	2913.0	290.2	2926.0	овар
++301.7	2913.0	313.3	2926.0	к
++324.8	2913.0	417.2	2926.0	доставке
++428.7	2913.0	498.0	2926.0	принял
++640.0	2910.0	740.2	2927.0	директор
++752.7	2910.0	840.4	2927.0	Черепко
++852.9	2910.0	903.0	2927.0	В.В.
++690.0	2953.0	803.1	2968.0	(должность,
++813.4	2953.0	895.6	2968.0	фамилия,
++905.9	2953.0	998.5	2968.0	инициалы,
++1008.7	2953.0	1091.0	2968.0	подпись)
++211.0	2992.0	235.1	3006.0	по
++247.2	2992.0	392.0	3006.0	доверенности
++582.0	2994.0	665.0	3005.0	печать
++1309.0	2992.0	1433.1	3009.0	выданной,
++1446.9	2992.0	1488.3	3009.0	ООО
++1502.1	2992.0	1640.0	3009.0	"КофеВенд"
++594.0	3032.0	664.5	3047.0	(номер,
++674.6	3032.0	725.0	3047.0	дата)
++1565.0	3037.0	1698.0	3050.0	(наименование
++1708.2	3037.0	1831.0	3050.0	организации)
++241.0	3073.0	311.1	3087.0	Принял
++322.8	3073.0	498.0	3087.0	грузополучатель
++652.0	3071.0	672.2	3090.0	i
++692.4	3071.0	753.0	3090.0	and
++773.2	3071.0	854.0	3090.0	most
++789.0	3113.0	900.1	3128.0	(должность,
++910.2	3113.0	980.9	3128.0	фамилия
++991.0	3113.0	1001.1	3128.0	и
++1011.2	3113.0	1102.1	3128.0	инициалы,
++1112.2	3113.0	1182.8	3128.0	полицск
++1192.9	3113.0	1243.4	3128.0	штамп
++1253.5	3113.0	1334.3	3128.0	(печать)
++1344.4	3113.0	1506.0	3128.0	грузополучателя)
++280.0	3154.0	364.3	3167.0	товаром
++376.3	3154.0	472.6	3167.0	переданы
++484.6	3154.0	605.0	3167.0	документы:
++1216.0	3188.0	1283.0	3199.0	PODE
++426.0	3275.0	456.6	3292.0	РУП
++466.8	3275.0	599.3	3292.0	«Издательство
++609.5	3275.0	762.4	3292.0	«Белбланкавыд»,
++772.6	3275.0	803.2	3292.0	а4,
++813.4	3275.0	874.5	3292.0	0197ц,
++884.7	3275.0	976.5	3292.0	III-2022,
++986.7	3275.0	1007.1	3292.0	т.
++1017.3	3275.0	1109.0	3292.0	1500000х2
++1804.0	3275.0	1825.2	3291.0	УП
++1835.8	3275.0	1931.1	3291.0	«Бумажная
++1941.7	3275.0	2026.5	3291.0	фабрика»
++2037.1	3275.0	2121.9	3291.0	Гознака,
++2132.5	3275.0	2174.9	3291.0	зак.
++2185.4	3275.0	2302.0	3291.0	13649-2022.
++480.0	3319.0	578.4	3336.0	Внимание!
++589.4	3319.0	611.2	3336.0	Не
++622.2	3319.0	709.6	3336.0	подлежит
++720.6	3319.0	840.9	3336.0	размножению
++851.8	3319.0	862.7	3336.0	и
++873.7	3319.0	961.1	3336.0	передаче
++972.1	3319.0	1048.6	3336.0	третьим
++1059.6	3319.0	1125.2	3336.0	лицам.
++1136.1	3319.0	1168.9	3336.0	Код
++1179.8	3319.0	1234.5	3336.0	формы
++1245.5	3319.0	1322.0	3336.0	401951.
+diff --git a/docflow/internal/recognize/testdata/header-0153-words.tsv b/docflow/internal/recognize/testdata/header-0153-words.tsv
+new file mode 100644
+index 0000000..bcb0dbb
+--- /dev/null
++++ b/docflow/internal/recognize/testdata/header-0153-words.tsv
+@@ -0,0 +1,180 @@
++x0	y0	x1	y1	text
++1159.0	147.0	1257.0	170.0	Exemple
++1271.0	147.0	1383.0	170.0	Services
++1291.0	255.0	1349.9	290.0	Акт
++1369.6	255.0	1389.2	290.0	№
++1408.9	255.0	1566.0	290.0	27-09/23
++1273.0	320.0	1473.6	353.0	выполненных
++1491.8	320.0	1583.0	353.0	работ
++1003.0	349.0	1113.9	425.0	Договор
++1129.7	349.0	1272.3	425.0	№11-ТО/20
++1288.2	349.0	1319.9	425.0	от
++1335.7	349.0	1494.1	425.0	07.04.2020
++1510.0	349.0	1541.7	425.0	г.
++1557.5	349.0	1747.6	425.0	Счет-фактура
++1763.5	349.0	1779.3	425.0	№
++1795.1	349.0	1921.9	425.0	27-09/23
++1937.7	349.0	1969.4	425.0	от
++1985.3	349.0	2112.0	425.0	27.09.23
++322.0	409.0	434.0	429.0	г.Минск
++838.0	539.0	893.5	635.0	Мы,
++839.0	539.0	1268.5	635.0	ограниченной
++843.0	539.0	1891.0	635.0	с
++912.0	539.0	1245.2	635.0	нижеподписавшиеся,
++1263.7	539.0	1504.3	635.0	представитель
++1304.3	539.0	1877.1	635.0	ответственностью
++1522.8	539.0	1689.4	635.0	Заказчика
++1707.9	539.0	1726.4	635.0	-
++1744.9	539.0	1893.0	635.0	Общество
++1912.9	539.0	2306.6	635.0	"КофеВенд",
++2342.4	539.0	2414.0	635.0	РБ
++803.0	580.0	813.0	677.0	,
++822.9	580.0	832.9	677.0	и
++842.9	580.0	972.4	677.0	представитель
++982.3	580.0	1091.9	677.0	Исполнителя
++1101.9	580.0	1111.9	677.0	-
++1121.8	580.0	1141.7	677.0	УП
++1151.7	580.0	1271.3	677.0	"Эреа-Маркет
++1281.2	580.0	1351.0	677.0	Сервис"
++1360.9	580.0	1380.9	677.0	.,
++1390.8	580.0	1480.5	677.0	составили
++1490.4	580.0	1580.1	677.0	настоящий
++1590.1	580.0	1620.0	677.0	Акт
++1629.9	580.0	1639.9	677.0	о
++1649.9	580.0	1689.7	677.0	том,
++1699.7	580.0	1729.6	677.0	что
++1739.5	580.0	1859.1	677.0	Исполнителем
++1869.0	580.0	1879.0	677.0	в
++577.0	613.0	699.3	680.0	соответствии
++709.5	613.0	719.7	680.0	с
++729.9	613.0	821.6	680.0	условиями
++831.8	613.0	913.4	680.0	Договора
++923.6	613.0	1015.3	680.0	выполнены
++1025.5	613.0	1117.3	680.0	следующие
++1127.5	613.0	1188.6	680.0	работы
++1198.8	613.0	1209.0	680.0	:
++301.0	707.0	341.0	723.0	No
++299.0	748.0	341.0	764.0	п/п
++829.0	758.0	1014.7	788.0	Наименование
++1030.2	758.0	1123.0	788.0	работы
++1590.0	770.0	1657.8	789.0	Сумма
++1671.3	770.0	1712.0	789.0	без
++1786.0	780.0	1871.0	799.0	Ставка
++1969.0	791.0	2053.0	810.0	Сумма
++1609.0	807.0	1665.0	823.0	НДС
++2238.0	806.0	2302.0	820.0	Bcero
++510.0	818.0	684.8	857.0	Диагностика
++700.7	818.0	939.0	857.0	монетоприемника
++1793.0	816.0	1849.0	833.0	НДС
++1979.0	826.0	2037.0	843.0	НДС
++1605.0	842.0	1667.0	860.0	(руб.)
++2235.0	842.0	2249.6	859.0	с
++2264.2	842.0	2308.0	859.0	НДС
++1795.0	852.0	1841.0	869.0	(%)
++302.0	861.0	318.0	878.0	2
++1973.0	863.0	2037.0	881.0	(руб.)
++2234.0	878.0	2298.0	897.0	(руб.)
++643.0	882.0	705.7	940.0	Замена
++716.1	882.0	778.8	940.0	мотора
++789.2	882.0	883.2	940.0	механизма
++893.7	882.0	956.3	940.0	выдачи
++966.8	882.0	1019.0	940.0	монет
++1029.4	882.0	1186.1	940.0	монетоприемника
++1196.6	882.0	1207.0	940.0	с
++1673.0	886.0	1761.0	907.0	35.00
++1818.0	896.0	1857.0	914.0	20
++2059.0	910.0	2122.0	928.0	7.00
++2303.0	922.0	2384.0	942.0	42.00
++1669.0	942.0	1759.0	965.0	59.00
++1816.0	950.0	1855.0	968.0	20
++300.0	957.0	316.0	974.0	3
++2041.0	963.0	2120.0	982.0	11.80
++587.0	972.0	738.6	1023.0	Калибровка
++753.7	972.0	981.0	1023.0	монетоприемника
++996.2	972.0	1087.1	1023.0	полная
++1102.3	972.0	1132.6	1023.0	(6
++1147.8	972.0	1269.0	1023.0	каналов)
++2303.0	977.0	2382.0	996.0	70.80
++299.0	1016.0	315.0	1030.0	4
++618.0	1029.0	709.8	1083.0	Чистка
++725.2	1029.0	954.8	1083.0	монетоприемника
++970.1	1029.0	985.4	1083.0	с
++1000.7	1029.0	1138.5	1083.0	проверкой
++1153.8	1029.0	1414.0	1083.0	работоспособности
++1665.0	1035.0	1751.0	1055.0	30.00
++1812.0	1042.0	1857.0	1061.0	20
++2050.0	1056.0	2116.0	1074.0	6.00
++2295.0	1067.0	2378.0	1088.0	36.00
++372.0	1072.0	472.0	1095.0	Итого:
++1664.0	1090.0	1752.0	1111.0	42.00
++1809.0	1096.0	1855.0	1116.0	20
++2048.0	1110.0	2114.0	1129.0	8.40
++2295.0	1124.0	2376.0	1144.0	50.40
++1645.0	1143.0	1747.0	1166.0	166.00
++2026.0	1162.0	2114.0	1185.0	33.20
++307.0	1170.0	385.3	1197.0	Всего
++401.0	1170.0	416.7	1197.0	с
++432.3	1170.0	495.0	1197.0	НДС:
++2277.0	1176.0	2372.0	1196.0	199.20
++764.0	1191.0	815.6	1238.0	Сто
++832.9	1191.0	987.8	1238.0	девяносто
++1005.0	1191.0	1108.3	1238.0	девять
++1125.5	1191.0	1228.8	1238.0	рублей
++1246.1	1191.0	1280.5	1238.0	20
++1297.7	1191.0	1401.0	1238.0	копеек
++292.0	1219.0	307.3	1248.0	В
++322.5	1219.0	383.6	1248.0	т.ч.
++398.9	1219.0	460.0	1248.0	НДС:
++713.0	1244.0	850.1	1283.0	Тридцать
++867.3	1244.0	918.7	1283.0	три
++935.9	1244.0	1021.6	1283.0	рубля
++1038.7	1244.0	1073.0	1283.0	20
++1090.1	1244.0	1193.0	1283.0	копеек
++764.0	1341.0	825.7	1434.0	По
++764.0	1341.0	1044.7	1434.0	порядке.
++765.0	1341.0	810.0	1434.0	и
++855.0	1341.0	1260.0	1434.0	оформлены
++856.6	1341.0	1165.1	1434.0	настоящему
++1079.8	1341.0	1114.9	1434.0	К
++1150.0	1341.0	1430.7	1434.0	качеству
++1196.0	1341.0	1319.4	1434.0	акту
++1305.0	1341.0	1350.0	1434.0	в
++1350.3	1341.0	1535.4	1434.0	работы
++1395.0	1341.0	1845.0	1434.0	надлежащем
++1465.7	1341.0	1851.7	1434.0	выполненных
++1566.3	1341.0	1844.0	1434.0	выполнены
++1886.8	1341.0	2062.2	1434.0	работ
++2097.3	1341.0	2378.0	1434.0	Заказчик
++745.0	1384.0	878.9	1471.0	претензий
++893.8	1384.0	923.5	1471.0	не
++938.4	1384.0	1027.6	1471.0	имеет.
++1042.5	1384.0	1102.0	1471.0	Узлы
++1116.9	1384.0	1131.8	1471.0	и
++1146.7	1384.0	1354.9	1471.0	комплектующие,
++1369.8	1384.0	1488.8	1471.0	вышедшие
++1503.7	1384.0	1533.4	1471.0	из
++1548.3	1384.0	1637.6	1471.0	строя,
++1652.4	1384.0	1801.2	1471.0	возвращены
++1816.1	1384.0	1950.0	1471.0	Заказчику
++1964.8	1384.0	1979.7	1471.0	и
++1994.6	1384.0	2113.6	1471.0	являются
++2128.5	1384.0	2307.0	1471.0	непригодными
++382.0	1413.0	428.8	1450.0	для
++444.4	1413.0	616.0	1450.0	дальнейшего
++631.6	1413.0	850.0	1450.0	использования.
++624.0	1471.0	653.9	1543.0	На
++668.8	1471.0	833.1	1543.0	выполненные
++848.1	1471.0	937.7	1543.0	работы
++952.6	1471.0	1146.8	1543.0	предоставлена
++1161.8	1471.0	1281.3	1543.0	гарантия
++1296.2	1471.0	1311.2	1543.0	в
++1326.1	1471.0	1430.7	1543.0	течение
++1445.6	1471.0	1475.5	1543.0	30
++1490.4	1471.0	1550.2	1543.0	дней
++1565.1	1471.0	1580.0	1543.0	с
++1595.0	1471.0	1654.7	1543.0	даты
++1669.7	1471.0	1834.0	1543.0	выполнения.
++272.0	1550.0	408.0	1576.0	Заказчик
++1636.0	1624.0	1832.0	1652.0	Исполнитель
++2211.0	1660.0	2266.1	1675.0	инко
++2279.9	1660.0	2335.0	1675.0	Т.Э.
+diff --git a/docflow/internal/recognize/testdata/header-0161-words.tsv b/docflow/internal/recognize/testdata/header-0161-words.tsv
+new file mode 100644
+index 0000000..5ca3331
+--- /dev/null
++++ b/docflow/internal/recognize/testdata/header-0161-words.tsv
+@@ -0,0 +1,313 @@
++x0	y0	x1	y1	text
++82.0	220.0	94.0	230.0	-
++1380.0	266.0	1541.1	293.0	СЧЕТ-ФАКТУРА
++1554.6	266.0	1568.0	293.0	№
++821.0	286.0	938.7	307.0	31.08.2023
++950.5	286.0	974.0	307.0	г.
++1763.0	287.0	1816.0	303.0	810
++1390.0	321.0	1465.0	336.0	август
++1560.0	324.0	1610.9	341.0	2023
++1623.6	324.0	1649.0	341.0	г.
++371.0	357.0	519.4	385.0	Получатель
++534.3	357.0	653.0	385.0	платежа:
++2191.0	356.0	2217.4	376.0	г.
++2230.7	356.0	2310.0	376.0	Гродно
++486.0	405.0	645.5	448.0	Наименование:
++657.8	405.0	805.0	448.0	Товарищество
++817.3	405.0	976.8	448.0	собственников
++989.0	405.0	1013.6	448.0	"1
++1025.8	405.0	1074.9	448.0	Мая,
++1087.2	405.0	1124.0	448.0	19"
++387.0	446.0	454.5	477.0	Адрес:
++465.8	446.0	488.3	477.0	г.
++499.6	446.0	578.4	477.0	Гродно,
++589.6	446.0	623.4	477.0	ул.
++634.7	446.0	645.9	477.0	1
++657.2	446.0	702.2	477.0	Мая,
++713.5	446.0	736.0	477.0	19
++536.0	495.0	576.8	549.0	УНП
++590.3	495.0	726.2	549.0	591018968,
++739.8	495.0	780.5	549.0	p/c
++794.1	495.0	1174.4	549.0	BY26REDJ30151002153500100933
++1188.0	495.0	1228.8	549.0	БИК
++1242.3	495.0	1351.0	549.0	REDJBY22
++411.0	535.0	562.8	571.0	Наименование
++575.4	535.0	651.3	571.0	банка:
++663.9	535.0	701.9	571.0	ЗАО
++714.5	535.0	841.0	571.0	"РРБ-Банк"
++329.0	627.0	512.0	651.0	Плательщик:
++386.0	676.0	560.6	707.0	Наименование:
++574.0	676.0	614.3	707.0	ООО
++627.7	676.0	762.0	707.0	"КофеВенд"
++415.0	721.0	461.0	755.0	Адрес:
++468.6	721.0	483.9	755.0	г.
++491.6	721.0	537.5	755.0	Минск,
++545.2	721.0	568.2	755.0	ул.
++575.8	721.0	660.1	755.0	Сторожевая,
++667.7	721.0	683.0	755.0	8,
++690.7	721.0	713.7	755.0	пом
++721.3	721.0	729.0	755.0	8
++543.0	864.0	655.3	914.0	Оплатить
++669.3	864.0	837.7	914.0	коммунальные
++851.7	864.0	935.9	914.0	услуги
++949.9	864.0	964.0	914.0	в
++978.0	864.0	1034.1	914.0	срок
++1048.1	864.0	1076.2	914.0	до
++1090.2	864.0	1118.3	914.0	25
++1132.3	864.0	1202.5	914.0	числа
++1216.5	864.0	1328.8	914.0	текущего
++1342.8	864.0	1427.0	914.0	месяца
++369.0	900.0	436.5	930.0	Адрес:
++447.8	900.0	470.3	930.0	г.
++481.6	900.0	560.4	930.0	Гродно,
++571.6	900.0	605.4	930.0	ул.
++616.7	900.0	627.9	930.0	1
++639.2	900.0	684.2	930.0	Мая,
++695.5	900.0	718.0	930.0	19
++359.0	942.0	481.6	971.0	Помещение
++495.2	942.0	508.9	971.0	№
++522.5	942.0	686.0	971.0	400/D-155580
++1267.0	990.0	1339.7	1017.0	Общая
++1354.2	990.0	1456.0	1017.0	площадь
++1676.0	1010.0	1711.5	1030.0	82,7
++1720.4	1010.0	1729.2	1030.0	M
++1738.1	1010.0	1747.0	1030.0	2
++507.0	1062.0	678.2	1091.0	Наименование
++692.4	1062.0	778.0	1091.0	услуги
++984.0	1068.0	1029.0	1084.0	Ед.
++1322.0	1079.0	1379.2	1106.0	Цена
++1393.5	1079.0	1436.5	1106.0	без
++1450.8	1079.0	1508.0	1106.0	НДС,
++1107.0	1092.0	1255.0	1115.0	Количество
++1786.0	1104.0	1889.0	1125.0	Ставка
++975.0	1114.0	1035.0	1128.0	изм.
++1558.0	1114.0	1640.9	1139.0	Сумма,
++1654.7	1114.0	1710.0	1139.0	руб.
++1973.0	1114.0	2048.5	1137.0	Сумма
++2063.6	1114.0	2124.0	1137.0	НДС,
++389.0	1123.0	516.6	1154.0	Возмещение
++529.3	1123.0	593.1	1154.0	части
++605.9	1123.0	810.0	1154.0	эксплуатационных
++2197.0	1124.0	2244.9	1144.0	Всего
++2254.4	1124.0	2264.0	1144.0	с
++1362.0	1132.0	1415.0	1147.0	руб.
++1782.0	1149.0	1830.7	1168.0	НДС,
++1842.8	1149.0	1855.0	1168.0	%
++375.0	1162.0	475.9	1195.0	расходов
++488.5	1162.0	513.7	1195.0	по
++526.4	1162.0	677.7	1195.0	обслуживанию
++690.3	1162.0	766.0	1195.0	здания
++2005.0	1162.0	2058.0	1177.0	руб.
++2183.0	1166.0	2242.1	1190.0	НДС,
++2256.9	1166.0	2316.0	1190.0	руб.
++983.0	1194.0	1020.0	1210.0	м2
++311.0	1205.0	427.4	1226.0	Земельный
++440.3	1205.0	505.0	1226.0	налог
++1202.0	1205.0	1254.0	1223.0	82,7
++1427.0	1216.0	1500.0	1233.0	1,6218
++1632.0	1227.0	1711.0	1244.0	134,12
++1781.0	1233.0	1827.7	1252.0	Без
++1843.3	1233.0	1890.0	1252.0	НДС
++980.0	1239.0	1016.0	1255.0	м2
++2038.0	1244.0	2093.0	1261.0	0,00
++1200.0	1249.0	1250.0	1268.0	82,7
++344.0	1253.0	487.0	1279.0	Теплоэнергия
++498.9	1253.0	630.0	1279.0	(отопление)
++2249.0	1255.0	2325.0	1273.0	134,12
++1417.0	1260.0	1496.0	1276.0	0,0000
++1655.0	1272.0	1707.0	1288.0	0,00
++1780.0	1277.0	1826.3	1298.0	Без
++1841.7	1277.0	1888.0	1298.0	НДС
++972.0	1283.0	1035.0	1302.0	Гкал
++2036.0	1289.0	2089.0	1306.0	0,00
++386.0	1299.0	529.0	1334.0	Теплоэнергия
++540.9	1299.0	648.2	1334.0	(подогрев
++660.1	1299.0	719.7	1334.0	воды,
++731.6	1299.0	815.0	1334.0	потери)
++2270.0	1300.0	2327.0	1318.0	0,00
++1396.0	1305.0	1496.0	1323.0	126,7768
++1652.0	1317.0	1709.0	1335.0	0,00
++1848.0	1326.0	1882.0	1342.0	20
++972.0	1331.0	1029.0	1347.0	Гкал
++2033.0	1335.0	2089.0	1352.0	0,00
++304.0	1341.0	354.0	1366.0	Вода
++366.5	1341.0	391.5	1366.0	по
++404.0	1341.0	504.0	1366.0	счетчику
++1225.0	1342.0	1235.0	1355.0	0
++2268.0	1346.0	2325.0	1363.0	0,00
++1394.0	1350.0	1494.0	1368.0	126,7768
++1650.0	1363.0	1705.0	1379.0	0,00
++1844.0	1371.0	1880.0	1387.0	20
++975.0	1375.0	1012.0	1390.0	м3
++2030.0	1380.0	2087.0	1396.0	0,00
++305.0	1386.0	354.2	1411.0	Сток
++366.6	1386.0	391.2	1411.0	по
++403.5	1386.0	502.0	1411.0	счетчику
++1199.0	1385.0	1248.0	1401.0	1,00
++2267.0	1391.0	2320.0	1408.0	0,00
++1417.0	1395.0	1494.0	1412.0	1,5350
++1657.0	1407.0	1702.0	1423.0	1,54
++1844.0	1413.0	1880.0	1429.0	20
++973.0	1418.0	1010.0	1434.0	м3
++2029.0	1423.0	2081.0	1440.0	0,31
++1196.0	1430.0	1246.0	1447.0	1,00
++392.0	1435.0	562.6	1468.0	Электроэнергия
++574.8	1435.0	623.5	1468.0	мест
++635.7	1435.0	708.8	1468.0	общего
++721.0	1435.0	855.0	1468.0	пользования
++2268.0	1434.0	2318.0	1450.0	1,84
++1413.0	1440.0	1485.0	1456.0	1,0481
++1649.0	1451.0	1698.0	1467.0	1,05
++1842.0	1458.0	1878.0	1474.0	20
++968.0	1463.0	1020.0	1479.0	кВт
++2028.0	1467.0	2079.0	1485.0	0,21
++342.0	1477.0	511.1	1506.0	Электроэнергия
++523.2	1477.0	547.3	1506.0	по
++559.4	1477.0	656.0	1506.0	счетчику
++1225.0	1477.0	1235.0	1487.0	0
++2267.0	1477.0	2320.0	1495.0	1,26
++1396.0	1483.0	1493.0	1501.0	0,40533
++1646.0	1494.0	1696.0	1511.0	0,00
++1842.0	1502.0	1878.0	1518.0	20
++967.0	1507.0	1020.0	1523.0	кВт
++2028.0	1511.0	2083.0	1529.0	0,00
++374.0	1520.0	483.5	1553.0	Обращение
++495.7	1520.0	507.9	1553.0	с
++520.1	1520.0	556.6	1553.0	ТКО
++568.7	1520.0	641.8	1553.0	(вывоз
++653.9	1520.0	666.1	1553.0	и
++678.3	1520.0	800.0	1553.0	обезвреж.)
++1204.0	1518.0	1235.0	1534.0	61
++1395.0	1526.0	1489.0	1544.0	0,40533
++2261.0	1523.0	2314.0	1541.0	0,00
++1631.0	1537.0	1698.0	1555.0	24,73
++1837.0	1546.0	1874.0	1562.0	20
++966.0	1551.0	1004.0	1567.0	м2
++2026.0	1556.0	2081.0	1572.0	4,95
++365.0	1565.0	481.7	1596.0	Освещение
++494.7	1565.0	624.4	1596.0	придомовой
++637.3	1565.0	767.0	1596.0	территории
++2247.0	1565.0	2310.0	1584.0	29,67
++1393.0	1571.0	1483.0	1587.0	0,02027
++1641.0	1583.0	1694.0	1599.0	0,00
++1835.0	1591.0	1872.0	1607.0	20
++965.0	1595.0	1002.0	1611.0	м2
++2023.0	1600.0	2081.0	1616.0	0,00
++363.0	1610.0	631.0	1640.0	Электроводонагреватель
++643.2	1610.0	765.0	1640.0	(резевный)
++2255.0	1611.0	2310.0	1627.0	0,00
++963.0	1638.0	1000.0	1655.0	м2
++373.0	1655.0	398.0	1688.0	ТО
++410.5	1655.0	522.8	1688.0	установок
++535.3	1655.0	672.7	1688.0	противопож.
++685.1	1655.0	810.0	1688.0	автоматики
++961.0	1684.0	996.0	1700.0	м2
++251.0	1693.0	316.0	1711.0	Пеня
++1179.0	1694.0	1231.0	1712.0	82,7
++1387.0	1703.0	1481.0	1721.0	0,02298
++1640.0	1716.0	1692.0	1733.0	1,90
++1829.0	1723.0	1866.0	1739.0	20
++2017.0	1732.0	2072.0	1750.0	0,38
++255.0	1739.0	341.0	1758.0	Итого
++2252.0	1745.0	2304.0	1763.0	2,28
++1633.0	1761.0	1688.0	1778.0	0,00
++1759.0	1764.0	1807.4	1788.0	Без
++1823.6	1764.0	1872.0	1788.0	НДС
++2016.0	1780.0	2072.0	1796.0	0,00
++304.0	1790.0	375.1	1813.0	Сальдо
++386.9	1790.0	410.6	1813.0	на
++422.5	1790.0	541.0	1813.0	01.08.2023
++2251.0	1790.0	2304.0	1808.0	0,00
++1601.0	1806.0	1690.0	1824.0	163,33
++1833.0	1816.0	1855.0	1832.0	X
++2010.0	1824.0	2073.0	1843.0	5,84
++298.0	1835.0	393.6	1859.0	Оплачено
++405.5	1835.0	417.4	1859.0	в
++429.4	1835.0	513.0	1859.0	августе
++2215.0	1832.0	2304.0	1855.0	169,17
++1607.0	1853.0	1688.0	1869.0	453,89
++2218.0	1877.0	2303.0	1898.0	453,89
++319.0	1882.0	442.5	1909.0	Предоплата
++454.8	1882.0	603.0	1909.0	теплоэнергия
++1594.0	1897.0	1682.0	1914.0	-454,67
++945.0	1910.0	1010.0	1929.0	Гкал
++1159.0	1921.0	1229.0	1937.0	0,000
++2213.0	1924.0	2296.0	1942.0	-454,67
++1368.0	1931.0	1471.0	1948.0	152,1322
++1627.0	1942.0	1684.0	1958.0	0,00
++370.0	1973.0	487.1	2002.0	Предоплата
++498.8	1973.0	651.1	2002.0	электоэнергия
++662.8	1973.0	733.0	2002.0	(факт.
++744.7	1973.0	815.0	2002.0	потр.)
++2243.0	1970.0	2298.0	1986.0	0,00
++947.0	1997.0	1000.0	2014.0	кВт
++1202.0	2011.0	1216.0	2027.0	2
++350.0	2015.0	478.8	2045.0	Предоплата
++491.6	2015.0	684.8	2045.0	эллектроэнергия
++697.6	2015.0	762.0	2045.0	(МОП)
++1372.0	2017.0	1469.0	2035.0	0,48640
++1625.0	2029.0	1680.0	2046.0	0,73
++944.0	2043.0	998.0	2060.0	кВт
++1199.0	2055.0	1211.0	2069.0	0
++2239.0	2058.0	2296.0	2077.0	0,73
++1371.0	2063.0	1465.0	2081.0	0,48640
++1623.0	2075.0	1678.0	2092.0	0,00
++879.0	2086.0	890.0	2101.0	0
++276.0	2102.0	348.5	2126.0	Итого
++363.0	2102.0	377.5	2126.0	к
++392.0	2102.0	479.0	2126.0	оплате
++2236.0	2103.0	2291.0	2121.0	0,00
++1850.0	2175.0	1870.0	2193.0	X
++2203.0	2194.0	2287.0	2213.0	169,13
++941.0	2283.0	996.0	2296.0	NKA
++942.0	2318.0	987.0	2334.0	TBO
++1002.0	2318.0	1047.0	2334.0	COR
++756.0	2347.0	817.8	2392.0	Итого
++830.1	2347.0	842.5	2392.0	к
++854.8	2347.0	929.0	2392.0	оплате
++941.3	2347.0	953.7	2392.0	с
++966.1	2347.0	1003.1	2392.0	НДС
++1015.5	2347.0	1052.5	2392.0	Сто
++1064.9	2347.0	1126.7	2392.0	шесть
++1139.0	2347.0	1200.8	2392.0	десят
++1213.2	2347.0	1287.3	2392.0	девять
++1299.7	2347.0	1361.4	2392.0	рубль
++1373.8	2347.0	1398.5	2392.0	13
++1410.9	2347.0	1485.0	2392.0	копеек
++246.0	2460.0	402.0	2479.0	Председатель
++1485.0	2515.0	1550.5	2536.0	Пузач
++1563.6	2515.0	1616.0	2536.0	В.В.
++229.0	2592.0	349.0	2611.0	Бухгалтер
++1510.0	2650.0	1656.4	2673.0	Мордвинцева
++1669.8	2650.0	1723.0	2673.0	А.А.
++411.0	2688.0	545.5	2730.0	Примечание:
++557.7	2688.0	704.5	2730.0	счет-фактура
++716.7	2688.0	814.5	2730.0	является
++826.8	2688.0	887.9	2730.0	актом
++900.1	2688.0	1034.6	2730.0	выполненных
++1046.9	2688.0	1108.0	2730.0	работ
++261.0	2729.0	350.2	2752.0	Получил
++362.9	2729.0	503.0	2752.0	покупатель:
++491.0	2829.0	602.0	2847.0	Должность
++1058.0	2856.0	1142.0	2871.0	Подпись
++1584.0	2879.0	1676.2	2900.0	Фамилия,
++1687.8	2879.0	1780.0	2900.0	инициалы
++239.0	2908.0	289.4	2929.0	Дата
++302.0	2908.0	428.0	2929.0	получения:
++251.0	2949.0	298.0	2974.0	тел.
++309.8	2949.0	486.0	2974.0	8-029-582-15-15
++652.0	3011.0	665.7	3084.0	В
++679.5	3011.0	761.8	3084.0	случае
++775.6	3011.0	885.4	3084.0	неоплаты
++899.1	3011.0	912.9	3084.0	в
++926.6	3011.0	981.5	3084.0	срок
++995.2	3011.0	1063.9	3084.0	будет
++1077.6	3011.0	1201.2	3084.0	начислена
++1214.9	3011.0	1269.8	3084.0	пеня
++1283.5	3011.0	1297.3	3084.0	и
++1311.0	3011.0	1462.0	3084.0	произведено
++1475.7	3011.0	1613.0	3084.0	отключение
++1626.8	3011.0	1819.0	3084.0	электроэнергии
++1832.7	3011.0	1846.4	3084.0	и
++1860.1	3011.0	2024.9	3084.0	коммунальных
++2038.6	3011.0	2121.0	3084.0	услуг.
+diff --git a/docflow/internal/recognize/testdata/header-0209-words.tsv b/docflow/internal/recognize/testdata/header-0209-words.tsv
+new file mode 100644
+index 0000000..2b2e2dc
+--- /dev/null
++++ b/docflow/internal/recognize/testdata/header-0209-words.tsv
+@@ -0,0 +1,133 @@
++x0	y0	x1	y1	text
++553.0	77.0	752.7	109.0	Счет-фактура
++769.4	77.0	836.0	109.0	№371
++852.6	77.0	885.9	109.0	от
++902.5	77.0	1069.0	109.0	31.08.2023
++601.0	183.0	763.4	222.0	Продавец
++783.7	183.0	1007.1	222.0	(подрядчик)
++1027.4	183.0	1271.0	222.0	работ(услуг)
++1358.0	207.0	1506.2	234.0	Минская
++1527.3	207.0	1612.0	234.0	ЦРКБ
++417.0	235.0	520.0	255.0	Адрес
++824.0	241.0	886.3	286.0	223053
++896.7	241.0	917.5	286.0	РБ
++927.9	241.0	1000.6	286.0	Минский
++1011.0	241.0	1052.6	286.0	р-н,
++1062.9	241.0	1083.7	286.0	д.
++1094.1	241.0	1187.6	286.0	Боровляны
++1198.0	241.0	1229.2	286.0	ул.
++1239.6	241.0	1364.2	286.0	Фрунзенская,
++1374.6	241.0	1385.0	286.0	1
++727.0	289.0	1217.7	335.0	ВҮ79АКВВ36320000001575600000,
++1234.6	289.0	1353.1	335.0	Минское
++1370.0	289.0	1522.3	335.0	областное
++1539.2	289.0	1708.4	335.0	управление
++1725.3	289.0	1793.0	335.0	№500
++592.0	338.0	662.4	376.0	"АСБ
++680.0	338.0	891.1	376.0	Беларусбанк"
++908.7	338.0	961.5	376.0	BIC
++979.1	338.0	1084.6	376.0	SWIFT:
++1102.2	338.0	1243.0	376.0	AKBBBY2X
++527.0	391.0	648.9	419.0	г.Минск,
++664.1	391.0	907.8	419.0	ул.Дзержинского,
++923.1	391.0	984.0	419.0	69/1
++544.0	440.0	598.0	470.0	УНП
++616.0	440.0	796.0	470.0	600208266,
++814.0	440.0	886.0	470.0	ОКПО
++904.0	440.0	1048.0	470.0	02017192
++554.0	515.0	883.1	550.0	Покупатель(заказчик)
++899.5	515.0	1097.0	550.0	работ(услуг)
++1069.0	583.0	1129.4	610.0	ООО
++1149.6	583.0	1351.0	610.0	"КофеВенд"
++619.0	620.0	694.6	657.0	Адрес
++709.7	620.0	815.6	657.0	220002,
++830.7	620.0	860.9	657.0	г.
++876.0	620.0	966.8	657.0	Минск,
++981.9	620.0	1027.2	657.0	ул.
++1042.4	620.0	1238.9	657.0	Сторожевская,
++1254.0	620.0	1284.3	657.0	8,
++1299.4	620.0	1375.0	657.0	пом.8
++452.0	675.0	506.7	698.0	УНП
++524.9	675.0	689.0	698.0	590888079
++1053.0	776.0	1184.0	794.0	Стоимость
++1321.0	783.0	1411.0	800.0	Ставка
++1509.0	789.0	1605.0	812.0	Сумма
++1703.0	793.0	1840.0	813.0	Стоимость
++552.0	818.0	715.6	845.0	Наименование
++729.2	818.0	879.2	845.0	выполненных
++892.8	818.0	961.0	845.0	работ
++1055.0	832.0	1220.0	855.0	работ(услуг),
++1325.0	841.0	1395.0	859.0	НДС,
++1518.0	847.0	1591.0	865.0	НДС,
++1710.0	853.0	1870.0	871.0	работ(услуг),
++618.0	869.0	743.9	890.0	(оказанных
++756.5	869.0	832.0	890.0	услуг)
++1041.0	890.0	1104.3	906.0	всего
++1117.0	890.0	1155.0	906.0	без
++1335.0	895.0	1358.0	911.0	%
++1520.0	905.0	1578.0	922.0	руб.
++1712.0	906.0	1776.3	927.0	всего
++1789.1	906.0	1802.0	927.0	с
++1814.9	906.0	1892.0	927.0	учетом
++1045.0	942.0	1102.8	968.0	НДС,
++1117.2	942.0	1175.0	968.0	руб.
++1695.0	959.0	1753.7	984.0	НДС,
++1768.3	959.0	1827.0	984.0	руб.
++1129.0	1012.0	1145.0	1029.0	2
++1335.0	1016.0	1351.0	1033.0	3
++1532.0	1022.0	1548.0	1039.0	4
++1792.0	1028.0	1808.0	1045.0	5
++527.0	1046.0	651.5	1075.0	Арендная
++667.1	1046.0	744.9	1075.0	плата
++760.4	1046.0	791.6	1075.0	за
++807.1	1046.0	900.5	1075.0	август
++916.1	1046.0	978.3	1075.0	2023
++993.9	1046.0	1025.0	1075.0	г.
++493.0	1099.0	604.2	1126.0	Договор
++620.0	1099.0	667.7	1126.0	№10
++683.6	1099.0	715.3	1126.0	от
++731.2	1099.0	890.0	1126.0	16.11.2020
++439.0	1151.0	501.7	1177.0	(аг.
++517.3	1151.0	674.0	1177.0	Колодищи).
++1103.0	1153.0	1188.0	1173.0	25,35
++1327.0	1156.0	1368.0	1175.0	20
++1513.0	1164.0	1578.0	1183.0	5,07
++1770.0	1169.0	1855.0	1190.0	30,42
++901.0	1237.0	1005.0	1260.0	Итого
++1102.0	1242.0	1188.0	1263.0	25,35
++1513.0	1253.0	1578.0	1274.0	5,07
++1767.0	1259.0	1851.0	1280.0	30,42
++424.0	1330.0	530.5	1357.0	Сумма
++551.8	1330.0	637.0	1357.0	НДС:
++837.0	1341.0	897.2	1372.0	5,07
++912.3	1341.0	972.6	1372.0	руб.
++987.6	1341.0	1047.9	1372.0	Пять
++1062.9	1341.0	1153.3	1372.0	рублей
++1168.4	1341.0	1198.5	1372.0	07
++1213.6	1341.0	1319.0	1372.0	копеек.
++1043.0	1403.0	1192.0	1421.0	прописью
++638.0	1435.0	719.0	1476.0	Всего
++735.2	1435.0	881.1	1476.0	выполнено
++897.3	1435.0	978.4	1476.0	работ
++994.6	1435.0	1124.2	1476.0	(оказано
++1140.4	1435.0	1237.7	1476.0	услуг)
++1253.9	1435.0	1286.3	1476.0	на
++1302.5	1435.0	1383.5	1476.0	сумму
++1399.8	1435.0	1416.0	1476.0	с
++1432.2	1435.0	1497.0	1476.0	НДС:
++541.0	1512.0	617.4	1544.0	30,42
++632.7	1512.0	693.9	1544.0	руб.
++709.2	1512.0	831.5	1544.0	Тридцать
++846.8	1512.0	938.5	1544.0	рублей
++953.8	1512.0	984.4	1544.0	42
++999.7	1512.0	1122.0	1544.0	копейки.
++1040.0	1583.0	1188.0	1600.0	прописью
++410.0	1763.0	529.0	1786.0	Главный
++546.0	1763.0	597.0	1786.0	вра
++1299.0	1783.0	1432.0	1806.0	Главный
++815.0	1875.0	954.0	1892.0	Барсамян
++1702.0	1890.0	1910.0	1917.0	Е.Я.Лукьянец
++401.0	1921.0	458.0	1932.0	ОДПИ
++1294.0	1935.0	1446.0	1958.0	подписьм
++1475.0	2352.0	1659.5	2382.0	Исполнитель
++1676.2	2352.0	1911.0	2382.0	Е.М.Красовская
+diff --git a/docflow/internal/recognize/testdata/header-0216-words.tsv b/docflow/internal/recognize/testdata/header-0216-words.tsv
+new file mode 100644
+index 0000000..986967d
+--- /dev/null
++++ b/docflow/internal/recognize/testdata/header-0216-words.tsv
+@@ -0,0 +1,247 @@
++x0	y0	x1	y1	text
++696.0	231.0	798.4	259.0	Поставщик
++809.8	231.0	821.2	259.0	и
++832.6	231.0	866.7	259.0	его
++878.1	231.0	935.0	259.0	адрес
++400.0	264.0	515.0	292.0	Учреждение
++526.5	264.0	699.0	292.0	здравоохранения
++359.0	296.0	426.7	333.0	220028,
++436.3	296.0	455.7	333.0	г.
++465.3	296.0	523.3	333.0	Минск,
++533.0	296.0	562.0	333.0	ул.
++571.7	296.0	707.0	333.0	Великоморская,
++716.7	296.0	736.0	333.0	36
++926.0	295.0	982.6	324.0	"11-я
++993.9	295.0	1095.8	324.0	городская
++1107.1	295.0	1243.0	324.0	поликлиника"
++1588.0	326.0	1749.1	354.0	СЧЕТ-ФАКТУРА
++1762.6	326.0	1776.0	354.0	№
++286.0	341.0	384.4	361.0	Расчетный
++395.3	341.0	439.0	361.0	счет
++1959.0	346.0	2004.0	360.0	336
++365.0	383.0	772.0	417.0	BY24AKBB36325240000640000000
++1657.0	420.0	1690.0	433.0	OT
++1754.0	420.0	1775.7	443.0	04
++1786.6	420.0	1873.4	443.0	.08.2023
++1884.3	420.0	1906.0	443.0	г.
++424.0	465.0	458.0	507.0	ЦБУ
++469.3	465.0	480.6	507.0	№
++492.0	465.0	525.9	507.0	527
++537.3	465.0	571.2	507.0	ОАО
++582.6	465.0	627.9	507.0	"АСБ
++639.2	465.0	786.5	507.0	"Беларусбанк"
++797.8	465.0	877.1	507.0	г.Минск
++888.4	465.0	922.4	507.0	БИК
++933.7	465.0	1013.0	507.0	АКВВҮ2Х
++282.0	493.0	319.2	514.0	УНП
++331.5	493.0	443.0	514.0	190497406
++279.0	574.0	328.5	593.0	ОКПО
++340.9	574.0	440.0	593.0	37629017
++949.0	654.0	1064.8	706.0	Плательщик
++1076.4	654.0	1088.0	706.0	и
++1099.6	654.0	1134.4	706.0	его
++1145.9	654.0	1215.4	706.0	адрес:
++1227.0	654.0	1261.8	706.0	ООО
++1273.4	654.0	1389.2	706.0	"КофеВенд"
++1400.8	654.0	1481.9	706.0	Договор
++1493.5	654.0	1539.8	706.0	5/20
++1551.4	654.0	1574.6	706.0	от
++1586.2	654.0	1702.0	706.0	01.11.2020
++1028.0	711.0	1079.5	752.0	220002.
++1086.9	711.0	1101.6	752.0	г.
++1109.0	711.0	1153.1	752.0	Минск.
++1160.5	711.0	1182.6	752.0	Ул.
++1190.0	711.0	1285.7	752.0	Сторожевская.
++1293.0	711.0	1322.5	752.0	Д.8.
++1329.8	711.0	1359.3	752.0	пом.
++1366.6	711.0	1374.0	752.0	8
++243.0	766.0	274.0	779.0	No
++1104.0	767.0	1145.3	791.0	УНП
++1159.1	767.0	1283.0	791.0	590888079
++652.0	791.0	797.8	821.0	Наименование
++810.0	791.0	882.9	821.0	прод.,
++895.1	791.0	968.0	821.0	товара
++237.0	802.0	276.0	814.0	п/п
++1205.0	824.0	1244.0	840.0	Ед.
++1312.0	828.0	1365.6	851.0	К-во
++1379.0	828.0	1446.0	851.0	Цена,
++1480.0	838.0	1601.0	862.0	Стоимось
++1641.0	848.0	1733.0	867.0	Ставка
++1801.0	859.0	1891.0	879.0	Сумма
++1946.0	866.0	1997.4	891.0	Сумма
++2007.7	866.0	2018.0	891.0	с
++1362.0	873.0	1409.0	887.0	ทงก
++1484.0	882.0	1544.6	900.0	прод.
++1556.7	882.0	1593.0	900.0	без
++1196.0	900.0	1244.0	912.0	ИЗМ
++1806.0	899.0	1872.0	915.0	нлс.
++1933.0	905.0	2007.0	923.0	нлс.
++1481.0	919.0	1597.0	943.0	НДС,руб.
++1638.0	922.0	1735.0	943.0	НДС,%
++372.0	937.0	382.8	972.0	1
++393.7	937.0	480.3	972.0	Арендная
++491.2	937.0	545.3	972.0	плата
++556.2	937.0	577.8	972.0	за
++588.7	937.0	653.7	972.0	август
++664.5	937.0	707.8	972.0	2023
++718.7	937.0	762.0	972.0	года
++1840.0	939.0	1891.0	953.0	руб.
++1994.0	948.0	2041.0	962.0	руб
++306.0	976.0	407.0	997.0	ИТОГО
++1536.0	1006.0	1599.0	1023.0	33.80
++1700.0	1015.0	1731.0	1031.0	20
++1861.0	1026.0	1911.0	1041.0	6.76
++2032.0	1035.0	2095.0	1052.0	40.56
++1535.0	1048.0	1599.0	1065.0	33.80
++266.0	1069.0	335.0	1093.0	Итого
++348.8	1069.0	362.6	1093.0	к
++376.4	1069.0	473.0	1093.0	оплате:
++1856.0	1067.0	1905.0	1081.0	6.76
++2031.0	1076.0	2095.0	1093.0	40.56
++699.0	1103.0	762.0	1178.0	Сорок
++774.6	1103.0	913.2	1178.0	белорусских
++925.8	1103.0	1014.0	1178.0	рублей,
++1026.6	1103.0	1051.8	1178.0	56
++1064.4	1103.0	1140.0	1178.0	копеек
++477.0	1202.0	657.0	1229.0	Руководитель
++1029.0	1212.0	1046.5	1238.0	15
++1055.2	1212.0	1064.0	1238.0	C
++1063.0	1232.0	1087.0	1243.0	60
++1199.0	1244.0	1327.6	1269.0	Болдырева
++1341.9	1244.0	1399.0	1269.0	И.Н.
++1040.0	1254.0	1052.0	1263.0	2
++1071.0	1260.0	1083.0	1271.0	5
++495.0	1290.0	591.4	1320.0	Главный
++605.2	1290.0	743.0	1320.0	бухгалтер_
++1026.0	1308.0	1037.6	1388.0	*
++1049.2	1308.0	1060.8	1388.0	*
++1072.4	1308.0	1084.0	1388.0	*
++281.0	1327.0	345.0	1345.0	М.П.
++1194.0	1333.0	1318.3	1357.0	Матюхова
++1333.8	1333.0	1396.0	1357.0	Ю.И.
++491.0	1383.0	588.6	1412.0	Ведущий
++602.6	1383.0	742.0	1412.0	экономист_
++1171.0	1423.0	1243.0	1443.0	Шелег
++1257.4	1423.0	1315.0	1443.0	А.С.
++1010.0	1452.0	1031.0	1464.0	45
++922.0	1480.0	944.8	1495.0	--
++956.2	1480.0	979.0	1495.0	-4
++599.0	2038.0	700.1	2063.0	Поставщик
++711.4	2038.0	722.6	2063.0	и
++733.9	2038.0	767.6	2063.0	его
++778.8	2038.0	835.0	2063.0	адрес
++302.0	2079.0	417.4	2110.0	Учреждение
++428.9	2079.0	602.0	2110.0	здравоохранения
++1510.0	2093.0	1556.7	2124.0	Акт
++1572.3	2093.0	1743.6	2124.0	выполненных
++1759.1	2093.0	1837.0	2124.0	работ
++828.0	2108.0	884.4	2139.0	"11-я
++895.7	2108.0	997.3	2139.0	городская
++1008.6	2108.0	1144.0	2139.0	поликлиника"
++260.0	2115.0	327.7	2148.0	220028,
++337.3	2115.0	356.7	2148.0	г.
++366.3	2115.0	424.3	2148.0	Минск,
++434.0	2115.0	463.0	2148.0	ул.
++472.7	2115.0	608.0	2148.0	Великоморская,
++617.7	2115.0	637.0	2148.0	36
++1576.0	2139.0	1695.0	2158.0	31.08.2023
++189.0	2153.0	286.1	2172.0	Расчетный
++296.9	2153.0	340.0	2172.0	счет
++1433.0	2181.0	1444.0	2208.0	к
++1455.0	2181.0	1587.0	2208.0	СЧЕТ-ФАКТУРЕ
++1598.0	2181.0	1609.0	2208.0	№
++266.0	2197.0	670.0	2230.0	BY24AKBB36325240000640000000
++1860.0	2205.0	1907.0	2222.0	336
++324.0	2281.0	358.0	2321.0	ЦБУ
++369.4	2281.0	380.7	2321.0	№
++392.1	2281.0	426.1	2321.0	527
++437.5	2281.0	471.5	2321.0	ОАО
++482.8	2281.0	528.2	2321.0	"АСБ
++539.6	2281.0	687.1	2321.0	"Беларусбанк"
++698.4	2281.0	777.8	2321.0	г.Минск
++789.2	2281.0	823.2	2321.0	БИК
++834.6	2281.0	914.0	2321.0	АКВВҮ2X
++184.0	2311.0	221.2	2334.0	УНП
++233.5	2311.0	345.0	2334.0	190497406
++182.0	2354.0	231.8	2374.0	ОКПО
++244.3	2354.0	344.0	2374.0	37629017
++854.0	2430.0	970.2	2477.0	Плательщик
++981.8	2430.0	993.4	2477.0	и
++1005.0	2430.0	1039.8	2477.0	его
++1051.5	2430.0	1121.2	2477.0	адрес:
++1132.8	2430.0	1167.6	2477.0	ООО
++1179.2	2430.0	1295.4	2477.0	"КофеВенд"
++1307.0	2430.0	1388.3	2477.0	Договор
++1399.9	2430.0	1446.4	2477.0	5/20
++1458.0	2430.0	1481.2	2477.0	от
++1492.8	2430.0	1609.0	2477.0	01.11.2020
++933.0	2486.0	984.4	2524.0	220002.
++991.7	2486.0	1006.4	2524.0	г.
++1013.7	2486.0	1057.8	2524.0	Минск.
++1065.1	2486.0	1087.1	2524.0	Ул.
++1094.5	2486.0	1189.9	2524.0	Сторожевская.
++1197.3	2486.0	1226.6	2524.0	Д.8.
++1234.0	2486.0	1263.3	2524.0	пом.
++1270.7	2486.0	1278.0	2524.0	8
++1007.0	2541.0	1047.8	2564.0	УНП
++1061.5	2541.0	1184.0	2564.0	590888079
++146.0	2545.0	179.0	2559.0	No
++697.0	2575.0	841.9	2606.0	Наименование
++854.0	2575.0	926.5	2606.0	прод.,
++938.5	2575.0	1011.0	2606.0	товара
++144.0	2582.0	186.0	2596.0	п/п
++1390.0	2613.0	1506.0	2633.0	Стоимось
++1544.0	2621.0	1638.0	2639.0	Ставка
++1706.0	2629.0	1789.0	2648.0	Сумма
++1852.0	2637.0	1900.6	2655.0	Сумма
++1910.3	2637.0	1920.0	2655.0	с
++1391.0	2655.0	1449.3	2672.0	прод.
++1461.0	2655.0	1496.0	2672.0	без
++1711.0	2668.0	1775.0	2685.0	нлс.
++1837.0	2676.0	1907.0	2692.0	нлс.
++1386.0	2694.0	1494.0	2713.0	НДС,руб.
++1544.0	2694.0	1636.0	2713.0	НДС,%
++1746.0	2708.0	1798.0	2725.0	руб.
++1898.0	2716.0	1948.0	2733.0	руб
++292.0	2722.0	379.3	2750.0	Арендная
++390.2	2722.0	444.8	2750.0	плата
++455.7	2722.0	477.5	2750.0	за
++488.4	2722.0	553.9	2750.0	август
++564.8	2722.0	608.4	2750.0	2023
++619.4	2722.0	663.0	2750.0	года
++210.0	2768.0	313.0	2788.0	ИТОГО
++1440.0	2782.0	1506.0	2801.0	33.80
++1576.0	2790.0	1638.0	2806.0	20.00
++1765.0	2801.0	1820.0	2817.0	6.76
++1936.0	2809.0	2002.0	2825.0	40.56
++173.0	2832.0	242.0	2857.0	Итого
++255.8	2832.0	269.6	2857.0	к
++283.4	2832.0	380.0	2857.0	оплате:
++1438.0	2834.0	1504.0	2851.0	33.80
++1763.0	2850.0	1818.0	2867.0	6.76
++624.0	2855.0	683.7	2887.0	Сорок
++695.7	2855.0	827.0	2887.0	белорусских
++839.0	2855.0	922.6	2887.0	рублей,
++934.5	2855.0	958.4	2887.0	56
++970.3	2855.0	1042.0	2887.0	копеек
++1935.0	2859.0	2002.0	2876.0	40.56
++176.0	2878.0	184.9	2901.0	в
++193.8	2878.0	220.4	2901.0	том
++229.3	2878.0	273.7	2901.0	числе
++282.6	2878.0	309.2	2901.0	НДС
++318.1	2878.0	327.0	2901.0	-
++602.0	2894.0	645.7	2939.0	Шесть
++654.5	2894.0	750.6	2939.0	белорусских
++759.4	2894.0	820.6	2939.0	рублей,
++829.3	2894.0	846.8	2939.0	76
++855.5	2894.0	908.0	2939.0	копеек
++155.0	2991.0	333.0	3016.0	Руководитель_
++698.0	3010.0	719.0	3026.0	125
++843.0	3029.0	970.9	3052.0	Болдырева
++985.1	3029.0	1042.0	3052.0	И.Н.
++1380.0	3056.0	1560.0	3080.0	Руководитель
++652.0	3087.0	694.8	3190.0	THIN
++705.5	3087.0	759.0	3190.0	SHEET
++181.0	3206.0	245.0	3225.0	M.II.
++566.0	3232.0	736.0	3280.0	Market
++479.0	3264.0	491.0	3271.0	.
+diff --git a/docflow/internal/recognize/testdata/header-0217-words.tsv b/docflow/internal/recognize/testdata/header-0217-words.tsv
+new file mode 100644
+index 0000000..25f151c
+--- /dev/null
++++ b/docflow/internal/recognize/testdata/header-0217-words.tsv
+@@ -0,0 +1,319 @@
++x0	y0	x1	y1	text
++454.0	257.0	583.9	328.0	Поставщик
++598.3	257.0	612.8	328.0	и
++627.2	257.0	670.5	328.0	его
++685.0	257.0	771.6	328.0	адрес:
++786.0	257.0	814.9	328.0	УЗ
++829.3	257.0	1002.5	328.0	"Клинический
++1017.0	257.0	1146.9	328.0	родильный
++1161.3	257.0	1204.6	328.0	дом
++1219.0	257.0	1320.1	328.0	Минской
++1334.5	257.0	1450.0	328.0	области"
++1783.0	332.0	1853.0	347.0	счёт-
++438.0	358.0	514.2	427.0	Номер
++529.4	358.0	620.8	427.0	счёта:
++636.0	358.0	1062.6	427.0	BY89AKBB36420000000755600000
++1077.8	358.0	1184.5	427.0	(IBAN),
++1199.7	358.0	1321.6	427.0	AKBBBY2X
++1336.8	358.0	1413.0	427.0	(BIC)
++1967.0	366.0	2004.0	382.0	No
++1764.0	378.0	1890.0	401.0	фактура
++2135.0	376.0	2182.0	391.0	б/н
++494.0	416.0	569.7	491.0	Банк:
++584.8	416.0	690.7	491.0	Минское
++705.8	416.0	842.0	491.0	областное
++857.2	416.0	1008.5	491.0	управление
++1023.6	416.0	1038.7	491.0	№
++1053.9	416.0	1099.3	491.0	500
++1114.4	416.0	1159.8	491.0	ОАО
++1174.9	416.0	1235.4	491.0	"АСБ
++1250.6	416.0	1432.2	491.0	Беларусбанк"
++1447.3	416.0	1492.7	491.0	УНН
++1507.8	416.0	1644.0	491.0	100287063
++1791.0	450.0	1829.0	467.0	15
++419.0	465.0	485.8	529.0	Адрес
++499.1	465.0	659.4	529.0	отправления:
++672.7	465.0	752.8	529.0	220076
++766.2	465.0	792.9	529.0	г.
++806.2	465.0	886.4	529.0	Минск,
++899.7	465.0	939.8	529.0	ул.
++953.1	465.0	979.8	529.0	Ф.
++993.2	465.0	1100.0	529.0	Скорины,
++1113.4	465.0	1140.1	529.0	16
++1153.4	465.0	1327.0	529.0	тел.263-50-55
++1939.0	464.0	2047.0	481.0	августа
++2121.0	469.0	2192.0	487.0	2023
++457.0	518.0	598.4	591.0	Плательщик
++612.5	518.0	626.6	591.0	и
++640.8	518.0	683.2	591.0	его
++697.3	518.0	782.1	591.0	адрес:
++796.2	518.0	838.6	591.0	ООО
++852.8	518.0	1008.3	591.0	"КофеВенд",
++1022.4	518.0	1121.4	591.0	220002,
++1135.5	518.0	1248.6	591.0	г.Минск,
++1262.7	518.0	1503.0	591.0	ул.Сторожевская,8
++291.0	568.0	441.9	610.0	Дополнение:
++455.6	568.0	551.6	610.0	Договор
++565.4	568.0	592.8	610.0	от
++606.5	568.0	771.1	610.0	01.03.2022г.
++784.8	568.0	826.0	610.0	№42
++159.0	609.0	199.2	629.0	Код
++212.6	609.0	293.0	629.0	статьи
++685.0	640.0	858.0	663.0	Наименование
++175.0	659.0	252.0	674.0	затрат
++1240.0	673.0	1353.0	697.0	Единица
++1402.0	683.0	1486.7	706.0	Расход
++1500.8	683.0	1529.0	706.0	по
++1593.0	694.0	1681.0	718.0	Тариф
++1788.0	703.0	1854.9	733.0	Сумма
++1868.3	703.0	1908.4	733.0	без
++1921.8	703.0	1935.2	733.0	в
++1948.6	703.0	1988.7	733.0	том
++2002.1	703.0	2069.0	733.0	числе
++1282.0	724.0	1393.6	751.0	измерени
++1407.5	724.0	1533.0	751.0	учреждени
++2088.0	721.0	2143.7	747.0	Сумма
++2154.9	721.0	2166.0	747.0	с
++1599.0	744.0	1655.0	761.0	руб.
++1761.0	750.0	1826.0	768.0	НДС,
++1913.0	758.0	1970.3	781.0	НДС,
++1984.7	758.0	2042.0	781.0	руб.
++2077.0	765.0	2125.8	790.0	НДС
++2142.0	765.0	2207.0	790.0	руб.
++1266.0	771.0	1278.0	782.0	Я
++1434.0	778.0	1450.0	791.0	Ю
++725.0	975.0	741.0	991.0	2
++161.0	1000.0	188.9	1023.0	за
++202.8	1000.0	258.5	1023.0	июль
++272.4	1000.0	356.0	1023.0	2023г.
++1259.0	1003.0	1273.0	1019.0	3
++1426.0	1014.0	1440.0	1029.0	4
++1601.0	1021.0	1615.0	1035.0	5
++1765.0	1030.0	1781.0	1046.0	6
++1940.0	1037.0	1952.0	1050.0	7
++2110.0	1045.0	2126.0	1062.0	8
++198.0	1050.0	315.8	1080.0	10.07.01.
++328.9	1050.0	486.0	1080.0	Теплоэнергия
++138.0	1099.0	254.0	1123.0	10.07.01.
++329.0	1110.0	515.0	1138.0	Теплоэнергия
++530.5	1110.0	577.0	1138.0	МОП
++1237.0	1108.0	1306.0	1126.0	Гкал
++1403.0	1116.0	1480.0	1134.0	0.000
++1568.0	1124.0	1693.0	1144.0	128.1406
++1735.0	1132.0	1831.0	1151.0	0.0000
++1909.0	1141.0	1998.0	1161.0	0.0000
++2081.0	1149.0	2174.0	1170.0	0.0000
++199.0	1155.0	315.6	1188.0	10.07.03.
++328.6	1155.0	510.0	1188.0	Электроэнергия
++1235.0	1162.0	1301.0	1180.0	Гкал
++1397.0	1169.0	1489.0	1188.0	70.710
++1564.0	1175.0	1679.0	1199.0	24.7187
++1729.0	1183.0	1828.0	1207.0	0.3313
++1906.0	1193.0	1995.0	1213.0	0.0663
++2079.0	1204.0	2170.0	1222.0	0.3976
++268.0	1212.0	338.0	1245.0	7.03.
++352.0	1212.0	548.0	1245.0	Электроэнергия
++562.0	1212.0	604.0	1245.0	МОП
++1234.0	1215.0	1304.0	1231.0	КВт/ч
++1404.0	1223.0	1461.0	1241.0	54.5
++1560.0	1229.0	1669.0	1249.0	0.40276
++1725.0	1238.0	1834.0	1258.0	21.9504
++1905.0	1248.0	1989.0	1266.0	4.3901
++2071.0	1255.0	2179.0	1275.0	26.3405
++136.0	1260.0	251.0	1283.0	10.07.04.
++1231.0	1266.0	1299.0	1283.0	КВт/ч
++380.0	1274.0	481.6	1305.0	Пожарный
++494.3	1274.0	570.5	1305.0	надзор
++583.2	1274.0	761.0	1305.0	(сигнализация)
++1379.0	1271.0	1406.8	1292.0	37
++1420.7	1271.0	1504.0	1292.0	061.00
++1558.0	1280.0	1667.0	1300.0	0.24590
++1734.0	1290.0	1816.0	1308.0	1.7277
++1902.0	1298.0	1993.0	1317.0	0.3455
++2075.0	1306.0	2163.0	1324.0	2.0732
++135.0	1312.0	250.0	1333.0	10.07.04.
++1226.0	1321.0	1293.0	1336.0	рубль
++438.0	1328.0	539.7	1369.0	Пожарный
++552.5	1328.0	628.8	1369.0	надзор
++641.5	1328.0	755.9	1369.0	(контроль
++768.7	1328.0	870.4	1369.0	пожарной
++883.1	1328.0	1023.0	1369.0	автоматики)
++1391.0	1325.0	1479.0	1343.0	798.75
++1562.0	1333.0	1650.0	1351.0	0.0757
++1727.0	1342.0	1816.0	1360.0	0.1262
++1902.0	1350.0	1988.0	1368.0	0.0252
++2072.0	1358.0	2161.0	1376.0	0.1514
++133.0	1364.0	258.0	1387.0	10.07.04.
++1225.0	1373.0	1295.0	1390.0	рубль
++429.0	1378.0	565.4	1420.0	Техническое
++577.8	1378.0	726.6	1420.0	обслуживание
++739.0	1378.0	838.2	1420.0	приборов
++850.6	1378.0	912.6	1420.0	учета
++925.0	1378.0	987.0	1420.0	тепла
++1395.0	1378.0	1467.0	1396.0	11.50
++1559.0	1385.0	1645.0	1404.0	0.0011
++1726.0	1394.0	1818.0	1412.0	0.0000
++1899.0	1402.0	1990.0	1420.0	0.0000
++2068.0	1410.0	2161.0	1428.0	0.0000
++432.0	1428.0	524.1	1468.0	Техническое
++532.5	1428.0	632.9	1468.0	обслуживание
++641.3	1428.0	725.0	1468.0	инженерных
++733.4	1428.0	775.3	1468.0	сетей
++783.6	1428.0	792.0	1468.0	и
++1223.0	1425.0	1293.0	1442.0	рубль
++1391.0	1431.0	1461.0	1448.0	50.00
++1558.0	1437.0	1648.0	1456.0	0.0047
++1720.0	1445.0	1814.0	1464.0	0.0094
++1898.0	1454.0	1986.0	1472.0	0.0000
++181.0	1459.0	293.7	1491.0	10.07.04.
++306.2	1459.0	469.0	1491.0	|оборудования
++2066.0	1462.0	2155.0	1480.0	0.0094
++219.0	1514.0	333.8	1550.0	10.07.04.
++346.6	1514.0	550.7	1550.0	Вневедомственная
++563.5	1514.0	640.0	1550.0	охрана
++1216.0	1517.0	1285.0	1532.0	рубль
++1369.0	1520.0	1397.2	1541.0	12
++1411.3	1520.0	1496.0	1541.0	923.59
++1560.0	1530.0	1643.0	1548.0	1.0243
++1717.0	1537.0	1811.0	1557.0	2.0486
++1892.0	1547.0	1979.0	1565.0	0.0000
++2062.0	1554.0	2155.0	1573.0	2.0486
++122.0	1564.0	243.0	1587.0	10.07.04.
++1215.0	1570.0	1285.0	1587.0	рубль
++1367.0	1573.0	1395.4	1594.0	13
++1409.7	1573.0	1495.0	1594.0	837.26
++336.0	1577.0	401.4	1610.0	Вывоз
++414.5	1577.0	427.6	1610.0	и
++440.6	1577.0	571.4	1610.0	утилизация
++584.5	1577.0	663.0	1610.0	мусора
++1560.0	1584.0	1643.0	1602.0	1.3116
++1716.0	1590.0	1810.0	1611.0	2.6232
++1891.0	1599.0	1979.0	1618.0	0.0000
++2060.0	1606.0	2155.0	1627.0	2.6232
++122.0	1619.0	245.0	1643.0	10.07.04.
++1213.0	1626.0	1285.0	1643.0	рубль
++1381.0	1628.0	1481.0	1649.0	367.10
++333.0	1632.0	398.4	1665.0	Вывоз
++411.5	1632.0	424.6	1665.0	и
++437.6	1632.0	568.4	1665.0	утилизация
++581.5	1632.0	660.0	1665.0	мусора
++1551.0	1638.0	1638.0	1656.0	0.1296
++1713.0	1646.0	1804.0	1664.0	0.2160
++1888.0	1653.0	1975.0	1672.0	0.0432
++2057.0	1660.0	2151.0	1681.0	0.2592
++119.0	1675.0	233.0	1698.0	10.03.05.
++1210.0	1680.0	1283.0	1696.0	рубль
++1384.0	1685.0	1442.0	1703.0	0.00
++376.0	1689.0	462.8	1722.0	Расходы
++475.2	1689.0	499.9	1722.0	на
++512.3	1689.0	636.3	1722.0	проведение
++648.7	1689.0	785.0	1722.0	дезинсекции
++1544.0	1691.0	1637.0	1711.0	0.0000
++1709.0	1699.0	1800.0	1718.0	0.0000
++1885.0	1706.0	1976.0	1727.0	0.0000
++2056.0	1716.0	2145.0	1734.0	0.0000
++113.0	1729.0	231.0	1752.0	10.03.05.
++1209.0	1734.0	1279.0	1750.0	рубль
++1373.0	1737.0	1461.0	1756.0	121.28
++415.0	1745.0	502.5	1784.0	Расходы
++515.0	1745.0	540.0	1784.0	на
++552.5	1745.0	652.5	1784.0	чистящие
++665.0	1745.0	740.0	1784.0	моющие
++752.5	1745.0	765.0	1784.0	и
++777.5	1745.0	852.5	1784.0	другие
++865.0	1745.0	965.0	1784.0	средства
++1543.0	1745.0	1634.0	1764.0	0.0115
++1707.0	1752.0	1800.0	1772.0	0.0192
++1883.0	1761.0	1971.0	1780.0	0.0038
++2052.0	1767.0	2147.0	1788.0	0.0230
++113.0	1783.0	231.0	1804.0	10.10.02.
++1207.0	1788.0	1277.0	1805.0	рубль
++305.0	1793.0	514.0	1817.0	Видеонаблюдение
++1373.0	1792.0	1452.0	1810.0	122.33
++1541.0	1800.0	1632.0	1818.0	0.0116
++1705.0	1806.0	1793.0	1825.0	0.0193
++1883.0	1814.0	1969.0	1833.0	0.0039
++2051.0	1821.0	2144.0	1842.0	0.0232
++1203.0	1841.0	1275.0	1858.0	рубль
++446.0	1846.0	532.4	1888.0	Расходы
++544.8	1846.0	569.5	1888.0	по
++581.8	1846.0	705.3	1888.0	заработной
++717.6	1846.0	779.3	1888.0	плате
++791.7	1846.0	964.5	1888.0	обслуживающего
++976.9	1846.0	1088.0	1888.0	персонала
++1377.0	1846.0	1438.0	1862.0	0.00
++1537.0	1852.0	1628.0	1870.0	0.0000
++1703.0	1859.0	1795.0	1877.0	0.0000
++1877.0	1866.0	1968.0	1886.0	0.0000
++2049.0	1875.0	2140.0	1893.0	0.0000
++123.0	1879.0	202.0	1897.0	10.01.
++354.0	1890.0	446.4	1921.0	(уборка
++459.6	1890.0	578.4	1921.0	помещений
++591.6	1890.0	750.0	1921.0	(служебных))
++1197.0	1934.0	1266.0	1951.0	рубль
++1353.0	1936.0	1367.2	1956.0	3
++1381.5	1936.0	1467.0	1956.0	943.52
++445.0	1941.0	502.3	1984.0	Расходы
++510.5	1941.0	526.9	1984.0	по
++535.0	1941.0	616.9	1984.0	заработной
++625.1	1941.0	666.0	1984.0	плате
++674.2	1941.0	788.8	1984.0	обслуживающего
++797.0	1941.0	870.6	1984.0	персонала
++878.8	1941.0	887.0	1984.0	(
++1535.0	1945.0	1626.0	1964.0	0.3738
++1700.0	1953.0	1791.0	1971.0	0.7476
++1875.0	1961.0	1963.0	1978.0	0.0000
++2044.0	1968.0	2134.0	1986.0	0.7476
++118.0	1973.0	194.0	1991.0	10.01.
++303.0	1981.0	376.9	2010.0	уборка
++389.2	1981.0	537.0	2010.0	территории.)
++104.0	2028.0	208.0	2046.0	10.10.03.
++1193.0	2028.0	1262.0	2044.0	рубль
++1367.0	2031.0	1461.0	2051.0	813.72
++317.0	2036.0	407.7	2063.0	Текущий
++420.6	2036.0	498.3	2063.0	ремонт
++511.3	2036.0	589.0	2063.0	зданий
++1531.0	2039.0	1622.0	2058.0	0.1719
++1696.0	2047.0	1787.0	2065.0	0.3438
++1869.0	2055.0	1957.0	2073.0	0.0000
++2040.0	2062.0	2128.0	2080.0	0.3438
++85.0	2078.0	206.0	2101.0	ИТОГО
++1192.0	2083.0	1262.0	2099.0	рубль
++1365.0	2087.0	1426.0	2104.0	0.00
++1530.0	2094.0	1618.0	2112.0	0.0000
++1694.0	2101.0	1785.0	2120.0	0.0000
++1869.0	2109.0	1955.0	2127.0	0.0000
++2040.0	2116.0	2126.0	2133.0	0.0000
++1699.0	2155.0	1779.0	2173.0	30.16
++1879.0	2163.0	1940.0	2181.0	4.88
++379.0	2170.0	485.0	2186.0	DPREOR
++2043.0	2169.0	2126.0	2190.0	35.04
++472.0	2203.0	497.7	2260.0	го
++510.6	2203.0	523.4	2260.0	к
++536.3	2203.0	626.3	2260.0	оплате:
++639.2	2203.0	742.1	2260.0	тридцать
++755.0	2203.0	806.4	2260.0	пять
++819.3	2203.0	896.4	2260.0	рублей
++909.3	2203.0	935.0	2260.0	04
++947.9	2203.0	1050.8	2260.0	копейки,
++1063.7	2203.0	1076.5	2260.0	в
++1089.4	2203.0	1128.0	2260.0	том
++1140.8	2203.0	1205.1	2260.0	числе
++1218.0	2203.0	1256.6	2260.0	НДС
++1269.4	2203.0	1282.3	2260.0	-
++1295.2	2203.0	1372.3	2260.0	четыре
++1385.2	2203.0	1449.5	2260.0	рубля
++1462.4	2203.0	1488.1	2260.0	88
++1501.0	2203.0	1591.0	2260.0	копеек.
++191.0	2306.0	385.6	2340.0	Заместитель
++403.3	2306.0	544.8	2340.0	главного
++562.5	2306.0	651.0	2340.0	врача
++194.0	2371.0	255.0	2410.0	(по
++275.3	2371.0	498.8	2410.0	медицинской
++519.1	2371.0	641.0	2410.0	части)
++1544.0	2427.0	1624.3	2458.0	О.В.
++1644.4	2427.0	1805.0	2458.0	Шапетько
++164.0	2501.0	379.5	2538.0	Зам.главного
++397.4	2501.0	577.0	2538.0	бухгалтера
++1536.0	2559.0	1615.4	2591.0	Е.Б.
++1635.2	2559.0	1794.0	2591.0	Климович
+diff --git a/docflow/internal/recognize/testdata/header-126-words.tsv b/docflow/internal/recognize/testdata/header-126-words.tsv
+new file mode 100644
+index 0000000..469d5cd
+--- /dev/null
++++ b/docflow/internal/recognize/testdata/header-126-words.tsv
+@@ -0,0 +1,167 @@
++x0	y0	x1	y1	text
++318.0	78.0	394.1	108.0	220073,
++405.0	78.0	491.9	108.0	г.Минск,
++502.8	78.0	535.4	108.0	ул.
++546.3	78.0	655.0	108.0	Пинская,18
++1278.0	180.0	1337.0	204.0	AKT
++998.0	231.0	1290.7	283.0	сдачи-приемки
++1313.2	231.0	1560.8	283.0	выполненных
++1583.3	231.0	1695.9	283.0	работ
++1718.4	231.0	1921.0	283.0	№У-000484
++331.0	294.0	453.9	324.0	составлен
++467.6	294.0	494.9	324.0	30
++508.5	294.0	617.8	324.0	сентября
++631.4	294.0	686.0	324.0	2023
++699.7	294.0	727.0	324.0	г.
++1495.0	350.0	1593.2	388.0	Договор
++1607.2	350.0	1691.4	388.0	аренды
++1705.4	350.0	1817.6	388.0	№А-48-22
++1831.6	350.0	1859.6	388.0	от
++1873.7	350.0	2013.9	388.0	01.10.2022
++2028.0	350.0	2056.0	388.0	г.
++271.0	382.0	417.0	407.0	Арендодатель:
++1022.0	415.0	1132.0	478.0	Открытое
++1145.7	415.0	1296.9	478.0	акционерное
++1310.6	415.0	1420.6	478.0	общество
++1434.3	415.0	1654.2	478.0	"Амкодор-Унимод"
++1668.0	415.0	1764.2	478.0	220073,
++1777.9	415.0	1887.9	478.0	г.Минск,
++1901.6	415.0	1942.9	478.0	ул.
++1956.6	415.0	2066.6	478.0	Пинская,
++2080.3	415.0	2107.8	478.0	18
++2121.6	415.0	2259.0	478.0	361-83-72,
++692.0	483.0	755.1	507.0	УНП:
++770.9	483.0	913.0	507.0	100010116
++1054.0	540.0	1068.4	613.0	№
++1082.8	540.0	1499.9	613.0	ВҮ52АКВВ30120524642515300000,
++1514.3	540.0	1586.2	613.0	Банк:
++1600.6	540.0	1643.7	613.0	ОАО
++1658.1	540.0	1715.6	613.0	"АСБ
++1730.0	540.0	1902.6	613.0	Беларусбанк"
++1917.0	540.0	1945.7	613.0	г.
++1960.1	540.0	2046.4	613.0	Минск,
++2060.8	540.0	2104.0	613.0	пр.
++2118.3	540.0	2305.3	613.0	Дзержинского,
++2319.7	540.0	2348.5	613.0	18
++2362.9	540.0	2406.0	613.0	БИК
++245.0	638.0	356.0	661.0	Арендатор:
++868.0	662.0	981.7	713.0	КофеВенд
++995.9	662.0	1038.6	713.0	ООО
++1052.8	662.0	1152.3	713.0	220002,
++1166.5	662.0	1266.0	713.0	г.Минск
++1280.2	662.0	1507.6	713.0	ул.Сторожевская,
++1521.9	662.0	1578.7	713.0	д.8,
++1592.9	662.0	1664.0	713.0	пом.8
++1033.0	755.0	1913.0	823.0	р/с
++1033.0	755.0	1243.5	823.0	Банк:
++1034.0	755.0	1062.5	823.0	№
++1034.0	755.0	1109.4	823.0	г.
++1091.0	755.0	1918.0	823.0	BY96BPSB30123133260199330000,
++1147.1	755.0	1373.4	823.0	Минск,
++1285.6	755.0	1411.9	823.0	ОАО
++1411.1	755.0	1562.0	823.0	пр-т
++1454.0	755.0	1664.4	823.0	"Сбер
++1599.7	755.0	2127.7	823.0	Независимости,
++1706.5	755.0	1917.0	823.0	Банк"
++2165.4	755.0	2354.0	823.0	32A-1
++724.0	870.0	858.2	947.0	Настоящий
++873.1	870.0	917.8	947.0	акт
++932.8	870.0	1081.9	947.0	составлен,
++1096.8	870.0	1111.7	947.0	с
++1126.6	870.0	1201.1	947.0	одной
++1216.1	870.0	1335.3	947.0	стороны,
++1350.3	870.0	1469.5	947.0	Открытое
++1484.4	870.0	1648.5	947.0	акционерное
++1663.4	870.0	1782.7	947.0	общество
++1797.6	870.0	2051.1	947.0	"Амкодор-Унимод",
++2066.0	870.0	2200.2	947.0	именуемым
++2215.1	870.0	2230.0	947.0	в
++2244.9	870.0	2394.0	947.0	дальнейшем
++723.0	910.0	950.5	987.0	"Арендодатель",
++965.6	910.0	980.8	987.0	и
++995.9	910.0	1011.1	987.0	с
++1026.3	910.0	1117.3	987.0	другой
++1132.4	910.0	1238.6	987.0	стороны
++1253.7	910.0	1375.0	987.0	КофеВенд
++1390.2	910.0	1450.9	987.0	ООО,
++1466.0	910.0	1602.5	987.0	именуемым
++1617.7	910.0	1632.8	987.0	в
++1648.0	910.0	1799.6	987.0	дальнейшем
++1814.8	910.0	1996.7	987.0	"Арендатор",
++2011.9	910.0	2027.1	987.0	в
++2042.2	910.0	2102.9	987.0	том,
++2118.1	910.0	2163.5	987.0	что
++2178.7	910.0	2391.0	987.0	"Арендодатель"
++378.0	1026.0	582.0	1056.0	Наименование
++599.0	1026.0	701.0	1056.0	работы
++830.0	1050.0	880.0	1068.0	Ед.
++1143.0	1064.0	1229.0	1083.0	Цена,
++442.0	1075.0	561.0	1096.0	(услуги)
++943.0	1072.0	1051.0	1092.0	Кол-во
++1391.0	1073.0	1562.0	1098.0	Стоимость,
++1664.0	1086.0	1775.0	1107.0	Ставка
++823.0	1094.0	884.0	1108.0	изм.
++1873.0	1094.0	1961.5	1119.0	Сумма
++1979.2	1094.0	2050.0	1119.0	НДС,
++197.0	1106.0	290.0	1124.0	Аренда
++1146.0	1106.0	1213.0	1124.0	BYN
++2159.0	1105.0	2239.8	1132.0	Всего
++2256.0	1105.0	2272.2	1132.0	с
++2288.3	1105.0	2353.0	1132.0	НДС,
++1423.0	1119.0	1490.0	1135.0	BYN
++1662.0	1129.0	1712.7	1152.0	НДС,
++1725.3	1129.0	1738.0	1152.0	%
++831.0	1137.0	872.0	1150.0	ШТ
++992.0	1142.0	1056.0	1157.0	1,000
++1907.0	1140.0	1973.0	1157.0	BYN
++200.0	1149.0	290.0	1168.0	Итого
++1227.0	1152.0	1288.0	1169.0	8,33
++2197.0	1151.0	2273.0	1170.0	BYN
++1554.0	1168.0	1614.0	1184.0	8,33
++1676.0	1173.0	1698.0	1189.0	20
++1709.0	1173.0	1720.0	1189.0	%
++2016.0	1189.0	2079.0	1208.0	1,67
++2313.0	1204.0	2380.0	1220.0	10,00
++1538.0	1210.0	1605.0	1231.0	8,33
++1999.0	1233.0	2062.0	1251.0	1,67
++224.0	1238.0	313.5	1264.0	Сумма
++331.4	1238.0	403.0	1264.0	НДС:
++2296.0	1245.0	2372.0	1265.0	10,00
++750.0	1263.0	812.2	1298.0	Один
++827.8	1263.0	999.0	1298.0	белорусский
++1014.6	1263.0	1092.4	1298.0	рубль
++1107.9	1263.0	1139.1	1298.0	67
++1154.6	1263.0	1248.0	1298.0	копеек
++197.0	1326.0	295.0	1345.0	Всего:
++758.0	1348.0	852.5	1388.0	Десять
++868.2	1348.0	1041.4	1388.0	белорусских
++1057.1	1348.0	1151.6	1388.0	рублей
++1167.3	1348.0	1198.8	1388.0	00
++1214.5	1348.0	1309.0	1388.0	копеек
++975.0	1442.0	1107.8	1495.0	Арендатор
++1122.5	1442.0	1137.3	1495.0	и
++1152.1	1442.0	1329.1	1495.0	Арендодатель
++1343.9	1442.0	1402.9	1495.0	друг
++1417.6	1442.0	1432.4	1495.0	к
++1447.1	1442.0	1520.9	1495.0	другу
++1535.7	1442.0	1668.5	1495.0	претензий
++1683.2	1442.0	1712.7	1495.0	не
++1727.5	1442.0	1816.0	1495.0	имеют.
++638.0	1521.0	844.0	1546.0	Арендодатель
++1919.0	1577.0	2081.0	1603.0	Арендатор
++475.0	1597.0	592.4	1644.0	Открытое
++607.1	1597.0	768.5	1644.0	акционерное
++783.2	1597.0	900.5	1644.0	общество
++915.2	1597.0	1150.0	1644.0	"Амкодор-Унимод"
++1898.0	1660.0	2043.3	1687.0	Кофевенд
++2061.5	1660.0	2116.0	1687.0	000
++184.0	1672.0	291.0	1690.0	Директор
++1140.0	1704.0	1200.5	1730.0	Кулик
++1212.6	1704.0	1261.0	1730.0	В.В.
++210.0	1757.0	294.0	1780.0	Главный
++306.0	1757.0	414.0	1780.0	бухгалтер
++1080.0	1794.0	1191.9	1815.0	Душевская
++1204.3	1794.0	1254.0	1815.0	М.Н.
++839.0	1837.0	923.0	1863.0	МИН
++805.0	1857.0	927.0	1887.0	AMMINIME.
++1932.0	2057.0	1990.0	2069.0	родно
+diff --git a/docflow/internal/recognize/testdata/header-218-words.tsv b/docflow/internal/recognize/testdata/header-218-words.tsv
+new file mode 100644
+index 0000000..989f5ae
+--- /dev/null
++++ b/docflow/internal/recognize/testdata/header-218-words.tsv
+@@ -0,0 +1,183 @@
++x0	y0	x1	y1	text
++215.0	120.0	339.8	136.0	Поставщик
++353.6	120.0	367.5	136.0	и
++381.4	120.0	423.0	136.0	его
++436.8	120.0	520.0	136.0	адрес:
++1972.0	119.0	2176.0	133.0	СЧЕТ-ФАКТУРА
++664.0	165.0	744.8	182.0	Филиал
++758.3	165.0	947.0	182.0	"Троллейбусный
++960.4	165.0	1014.3	182.0	парк
++1027.8	165.0	1068.2	182.0	№5"
++1081.7	165.0	1297.3	182.0	государственного
++1310.8	165.0	1459.0	182.0	предприятия
++460.0	201.0	626.0	219.0	"Минсктранс"
++2020.0	204.0	2072.0	218.0	118
++530.0	247.0	619.8	265.0	220070,
++632.7	247.0	735.3	265.0	г.Минск,
++748.2	247.0	915.0	265.0	ул.Солтыса,26
++428.0	291.0	500.0	306.0	УНН:
++644.0	291.0	781.0	306.0	102299113
++1965.0	291.0	1990.0	309.0	28
++2002.5	291.0	2090.0	309.0	августа
++2102.5	291.0	2152.5	309.0	2023
++2165.0	291.0	2190.0	309.0	г.
++435.0	336.0	535.0	351.0	ОКПО:
++658.0	337.0	837.0	352.0	376289405010
++1924.0	339.0	1937.4	354.0	к
++1950.8	339.0	2084.7	354.0	платежному
++2098.1	339.0	2232.0	354.0	поручению:
++683.0	383.0	737.3	400.0	Р/сч
++750.9	383.0	1131.2	400.0	ВУ88АКВВ30120000086735200000
++1144.7	383.0	1158.3	400.0	в
++1171.9	383.0	1212.6	400.0	ОАО
++1226.2	383.0	1280.5	400.0	"АСБ
++1294.1	383.0	1470.7	400.0	Беларусбанк",
++1484.3	383.0	1525.0	400.0	ул.
++539.0	421.0	732.7	439.0	Долгобродская,
++746.5	421.0	774.2	439.0	1,
++788.0	421.0	829.5	439.0	BIC
++843.3	421.0	954.0	439.0	AKBBBY2X
++1982.0	424.0	2023.0	437.0	OT
++224.0	513.0	364.4	530.0	Плательщик
++378.5	513.0	392.5	530.0	и
++406.6	513.0	448.7	530.0	его
++462.7	513.0	547.0	530.0	адрес:
++474.0	558.0	520.3	575.0	ОАО
++535.7	558.0	690.0	575.0	"КофеВенд"
++585.0	602.0	633.4	620.0	220002
++641.5	602.0	657.6	620.0	г.
++665.7	602.0	714.1	620.0	Минск,
++722.1	602.0	746.3	620.0	ул.
++754.4	602.0	859.3	620.0	Сторожевская,
++867.3	602.0	875.4	620.0	8
++883.5	602.0	931.9	620.0	помещ.
++939.9	602.0	948.0	620.0	8
++430.0	646.0	502.0	660.0	УНН:
++645.0	646.0	781.0	661.0	590888079
++434.0	691.0	524.0	706.0	ОКПО:
++707.0	736.0	761.7	754.0	Р/сч
++775.4	736.0	1158.7	754.0	BY96BPSB30123133260199330000
++1172.3	736.0	1186.0	754.0	в
++1199.7	736.0	1240.8	754.0	ОАО
++1254.5	736.0	1459.8	754.0	"БПС-Сбербанк",
++1473.4	736.0	1569.3	754.0	бульвар
++1582.9	736.0	1624.0	754.0	им,
++523.0	775.0	649.4	792.0	Мулявина,
++663.4	775.0	691.5	792.0	6,
++705.5	775.0	747.6	792.0	BIC
++761.7	775.0	874.0	792.0	BPSBBY2X
++895.0	866.0	942.0	883.0	Ед.
++1217.0	866.0	1289.0	882.0	Цена
++1459.0	865.0	1534.6	881.0	Сумма
++1549.7	865.0	1595.0	881.0	без
++1695.0	864.0	1791.0	880.0	Ставка
++1885.0	865.0	1977.0	881.0	Сумма
++2071.0	863.0	2146.4	882.0	Сумма
++2161.5	863.0	2176.6	882.0	с
++2191.7	863.0	2252.0	882.0	НДС,
++323.0	867.0	481.6	884.0	Наименование
++494.8	867.0	508.0	884.0	и
++521.2	867.0	613.8	884.0	краткая
++627.0	867.0	812.0	884.0	характеристика
++1015.0	882.0	1109.0	900.0	Кол-во
++368.0	905.0	441.9	923.0	товара
++454.2	905.0	565.0	923.0	(артикул,
++577.3	905.0	651.1	923.0	марка,
++663.4	905.0	725.0	923.0	сорт)
++896.0	905.0	950.0	920.0	изм.
++1179.0	906.0	1366.0	921.0	производителя
++1463.0	903.0	1519.4	923.0	НДС,
++1533.6	903.0	1590.0	923.0	руб.
++1711.0	903.0	1775.0	922.0	НДС
++1877.0	904.0	1930.8	922.0	НДС,
++1944.2	904.0	1998.0	922.0	руб.
++2118.0	905.0	2172.0	923.0	руб.
++291.0	949.0	343.1	966.0	Пеня
++356.1	949.0	382.2	966.0	по
++395.2	949.0	551.5	966.0	коммунальным
++564.5	949.0	655.7	966.0	услугам
++668.7	949.0	681.8	966.0	с
++694.8	949.0	772.9	966.0	21.08.
++785.9	949.0	812.0	966.0	по
++162.0	986.0	293.0	1001.0	25.08.2023
++1091.0	988.0	1104.0	1003.0	5
++1584.0	987.0	1647.0	1004.0	0,35
++2200.0	986.0	2263.0	1003.0	0,35
++878.0	990.0	936.0	1007.0	руб.
++1267.0	1030.0	1372.0	1047.0	ИТОГО:
++1584.0	1032.0	1647.0	1049.0	0,35
++2202.0	1030.0	2265.0	1048.0	0,35
++205.0	1077.0	278.2	1095.0	Сумма
++292.8	1077.0	336.7	1095.0	НДС
++351.3	1077.0	483.0	1095.0	прописью:
++759.0	1077.0	815.7	1095.0	Ноль
++829.9	1077.0	985.9	1095.0	белорусских
++1000.1	1077.0	1085.2	1095.0	рублей
++1099.4	1077.0	1127.7	1095.0	00
++1141.9	1077.0	1227.0	1095.0	копеек
++218.0	1120.0	294.0	1139.0	ВСЕГО
++309.1	1120.0	324.3	1139.0	с
++339.5	1120.0	385.1	1139.0	НДС
++400.3	1120.0	537.0	1139.0	прописью:
++760.0	1121.0	816.8	1140.0	Ноль
++831.1	1121.0	987.4	1140.0	белорусских
++1001.6	1121.0	1086.9	1140.0	рублей
++1101.1	1121.0	1129.5	1140.0	35
++1143.7	1121.0	1229.0	1140.0	копеек
++449.0	1159.0	540.6	1190.0	NAKA
++563.4	1159.0	655.0	1190.0	DENA
++211.0	1259.0	331.0	1274.0	Начальник
++344.3	1259.0	491.0	1274.0	бухгалтерии
++906.0	1257.0	936.2	1276.0	Н.
++951.2	1257.0	981.4	1276.0	В.
++996.5	1257.0	1087.0	1276.0	Некраш
++139.0	1347.0	200.0	1363.0	Ч.П.
++455.0	1387.0	515.9	1416.0	NAPK
++531.1	1387.0	546.3	1416.0	№
++561.6	1387.0	592.0	1416.0	5»
++924.0	1391.0	977.4	1409.0	Н.И.
++990.8	1391.0	1111.0	1409.0	Чернецкая
++476.0	1513.0	537.0	1522.0	HCKI
++1965.0	2467.0	2175.0	2481.0	.
++261.0	2489.0	324.0	2500.0	.
++679.0	2545.0	722.3	2556.0	-
++765.7	2545.0	809.0	2556.0	-
++400.0	2999.0	413.1	3023.0	γ
++426.3	2999.0	899.0	3023.0	....................................
++264.0	3041.0	294.7	3058.0	¥
++325.4	3041.0	479.0	3058.0	.....
++323.0	3077.0	362.6	3102.0	3)
++382.3	3077.0	540.6	3102.0	services
++560.3	3077.0	599.9	3102.0	of
++619.7	3077.0	679.0	3102.0	the
++2129.0	3117.0	2196.0	3141.0	e
++2263.0	3117.0	2330.0	3141.0	.
++208.0	3248.0	287.0	3262.0	400
++1419.0	3261.0	1738.0	3275.0	0.00
++130.0	3300.0	211.0	3311.0	`
++1319.0	3319.0	1732.0	3342.0	•
++360.0	3330.0	437.9	3351.0	With
++457.3	3330.0	515.7	3351.0	the
++535.2	3330.0	652.0	3351.0	second
++1547.0	3438.0	1556.3	3458.0	,
++1565.6	3438.0	1901.0	3458.0	....................................
++2240.0	3445.0	2243.6	3460.0	.
++2247.3	3445.0	2250.9	3460.0	.
++2254.6	3445.0	2258.2	3460.0	.
++2261.8	3445.0	2265.5	3460.0	.
++2269.1	3445.0	2272.8	3460.0	.
++2276.4	3445.0	2280.1	3460.0	.
++2283.7	3445.0	2287.3	3460.0	.
++2291.0	3445.0	2294.6	3460.0	.
++2298.3	3445.0	2301.9	3460.0	.
++2305.5	3445.0	2309.2	3460.0	.
++2312.8	3445.0	2316.5	3460.0	.
++2320.1	3445.0	2323.7	3460.0	.
++2327.4	3445.0	2331.0	3460.0	.
++2334.7	3445.0	2338.3	3460.0	.
++2341.9	3445.0	2345.6	3460.0	.
++2349.2	3445.0	2352.9	3460.0	.
++2356.5	3445.0	2360.2	3460.0	.
++2363.8	3445.0	2367.4	3460.0	.
++2371.1	3445.0	2374.7	3460.0	.
++2378.4	3445.0	2382.0	3460.0	.
+diff --git a/docflow/internal/recognize/testdata/skew-126-words.tsv b/docflow/internal/recognize/testdata/skew-126-words.tsv
+new file mode 100644
+index 0000000..469d5cd
+--- /dev/null
++++ b/docflow/internal/recognize/testdata/skew-126-words.tsv
+@@ -0,0 +1,167 @@
++x0	y0	x1	y1	text
++318.0	78.0	394.1	108.0	220073,
++405.0	78.0	491.9	108.0	г.Минск,
++502.8	78.0	535.4	108.0	ул.
++546.3	78.0	655.0	108.0	Пинская,18
++1278.0	180.0	1337.0	204.0	AKT
++998.0	231.0	1290.7	283.0	сдачи-приемки
++1313.2	231.0	1560.8	283.0	выполненных
++1583.3	231.0	1695.9	283.0	работ
++1718.4	231.0	1921.0	283.0	№У-000484
++331.0	294.0	453.9	324.0	составлен
++467.6	294.0	494.9	324.0	30
++508.5	294.0	617.8	324.0	сентября
++631.4	294.0	686.0	324.0	2023
++699.7	294.0	727.0	324.0	г.
++1495.0	350.0	1593.2	388.0	Договор
++1607.2	350.0	1691.4	388.0	аренды
++1705.4	350.0	1817.6	388.0	№А-48-22
++1831.6	350.0	1859.6	388.0	от
++1873.7	350.0	2013.9	388.0	01.10.2022
++2028.0	350.0	2056.0	388.0	г.
++271.0	382.0	417.0	407.0	Арендодатель:
++1022.0	415.0	1132.0	478.0	Открытое
++1145.7	415.0	1296.9	478.0	акционерное
++1310.6	415.0	1420.6	478.0	общество
++1434.3	415.0	1654.2	478.0	"Амкодор-Унимод"
++1668.0	415.0	1764.2	478.0	220073,
++1777.9	415.0	1887.9	478.0	г.Минск,
++1901.6	415.0	1942.9	478.0	ул.
++1956.6	415.0	2066.6	478.0	Пинская,
++2080.3	415.0	2107.8	478.0	18
++2121.6	415.0	2259.0	478.0	361-83-72,
++692.0	483.0	755.1	507.0	УНП:
++770.9	483.0	913.0	507.0	100010116
++1054.0	540.0	1068.4	613.0	№
++1082.8	540.0	1499.9	613.0	ВҮ52АКВВ30120524642515300000,
++1514.3	540.0	1586.2	613.0	Банк:
++1600.6	540.0	1643.7	613.0	ОАО
++1658.1	540.0	1715.6	613.0	"АСБ
++1730.0	540.0	1902.6	613.0	Беларусбанк"
++1917.0	540.0	1945.7	613.0	г.
++1960.1	540.0	2046.4	613.0	Минск,
++2060.8	540.0	2104.0	613.0	пр.
++2118.3	540.0	2305.3	613.0	Дзержинского,
++2319.7	540.0	2348.5	613.0	18
++2362.9	540.0	2406.0	613.0	БИК
++245.0	638.0	356.0	661.0	Арендатор:
++868.0	662.0	981.7	713.0	КофеВенд
++995.9	662.0	1038.6	713.0	ООО
++1052.8	662.0	1152.3	713.0	220002,
++1166.5	662.0	1266.0	713.0	г.Минск
++1280.2	662.0	1507.6	713.0	ул.Сторожевская,
++1521.9	662.0	1578.7	713.0	д.8,
++1592.9	662.0	1664.0	713.0	пом.8
++1033.0	755.0	1913.0	823.0	р/с
++1033.0	755.0	1243.5	823.0	Банк:
++1034.0	755.0	1062.5	823.0	№
++1034.0	755.0	1109.4	823.0	г.
++1091.0	755.0	1918.0	823.0	BY96BPSB30123133260199330000,
++1147.1	755.0	1373.4	823.0	Минск,
++1285.6	755.0	1411.9	823.0	ОАО
++1411.1	755.0	1562.0	823.0	пр-т
++1454.0	755.0	1664.4	823.0	"Сбер
++1599.7	755.0	2127.7	823.0	Независимости,
++1706.5	755.0	1917.0	823.0	Банк"
++2165.4	755.0	2354.0	823.0	32A-1
++724.0	870.0	858.2	947.0	Настоящий
++873.1	870.0	917.8	947.0	акт
++932.8	870.0	1081.9	947.0	составлен,
++1096.8	870.0	1111.7	947.0	с
++1126.6	870.0	1201.1	947.0	одной
++1216.1	870.0	1335.3	947.0	стороны,
++1350.3	870.0	1469.5	947.0	Открытое
++1484.4	870.0	1648.5	947.0	акционерное
++1663.4	870.0	1782.7	947.0	общество
++1797.6	870.0	2051.1	947.0	"Амкодор-Унимод",
++2066.0	870.0	2200.2	947.0	именуемым
++2215.1	870.0	2230.0	947.0	в
++2244.9	870.0	2394.0	947.0	дальнейшем
++723.0	910.0	950.5	987.0	"Арендодатель",
++965.6	910.0	980.8	987.0	и
++995.9	910.0	1011.1	987.0	с
++1026.3	910.0	1117.3	987.0	другой
++1132.4	910.0	1238.6	987.0	стороны
++1253.7	910.0	1375.0	987.0	КофеВенд
++1390.2	910.0	1450.9	987.0	ООО,
++1466.0	910.0	1602.5	987.0	именуемым
++1617.7	910.0	1632.8	987.0	в
++1648.0	910.0	1799.6	987.0	дальнейшем
++1814.8	910.0	1996.7	987.0	"Арендатор",
++2011.9	910.0	2027.1	987.0	в
++2042.2	910.0	2102.9	987.0	том,
++2118.1	910.0	2163.5	987.0	что
++2178.7	910.0	2391.0	987.0	"Арендодатель"
++378.0	1026.0	582.0	1056.0	Наименование
++599.0	1026.0	701.0	1056.0	работы
++830.0	1050.0	880.0	1068.0	Ед.
++1143.0	1064.0	1229.0	1083.0	Цена,
++442.0	1075.0	561.0	1096.0	(услуги)
++943.0	1072.0	1051.0	1092.0	Кол-во
++1391.0	1073.0	1562.0	1098.0	Стоимость,
++1664.0	1086.0	1775.0	1107.0	Ставка
++823.0	1094.0	884.0	1108.0	изм.
++1873.0	1094.0	1961.5	1119.0	Сумма
++1979.2	1094.0	2050.0	1119.0	НДС,
++197.0	1106.0	290.0	1124.0	Аренда
++1146.0	1106.0	1213.0	1124.0	BYN
++2159.0	1105.0	2239.8	1132.0	Всего
++2256.0	1105.0	2272.2	1132.0	с
++2288.3	1105.0	2353.0	1132.0	НДС,
++1423.0	1119.0	1490.0	1135.0	BYN
++1662.0	1129.0	1712.7	1152.0	НДС,
++1725.3	1129.0	1738.0	1152.0	%
++831.0	1137.0	872.0	1150.0	ШТ
++992.0	1142.0	1056.0	1157.0	1,000
++1907.0	1140.0	1973.0	1157.0	BYN
++200.0	1149.0	290.0	1168.0	Итого
++1227.0	1152.0	1288.0	1169.0	8,33
++2197.0	1151.0	2273.0	1170.0	BYN
++1554.0	1168.0	1614.0	1184.0	8,33
++1676.0	1173.0	1698.0	1189.0	20
++1709.0	1173.0	1720.0	1189.0	%
++2016.0	1189.0	2079.0	1208.0	1,67
++2313.0	1204.0	2380.0	1220.0	10,00
++1538.0	1210.0	1605.0	1231.0	8,33
++1999.0	1233.0	2062.0	1251.0	1,67
++224.0	1238.0	313.5	1264.0	Сумма
++331.4	1238.0	403.0	1264.0	НДС:
++2296.0	1245.0	2372.0	1265.0	10,00
++750.0	1263.0	812.2	1298.0	Один
++827.8	1263.0	999.0	1298.0	белорусский
++1014.6	1263.0	1092.4	1298.0	рубль
++1107.9	1263.0	1139.1	1298.0	67
++1154.6	1263.0	1248.0	1298.0	копеек
++197.0	1326.0	295.0	1345.0	Всего:
++758.0	1348.0	852.5	1388.0	Десять
++868.2	1348.0	1041.4	1388.0	белорусских
++1057.1	1348.0	1151.6	1388.0	рублей
++1167.3	1348.0	1198.8	1388.0	00
++1214.5	1348.0	1309.0	1388.0	копеек
++975.0	1442.0	1107.8	1495.0	Арендатор
++1122.5	1442.0	1137.3	1495.0	и
++1152.1	1442.0	1329.1	1495.0	Арендодатель
++1343.9	1442.0	1402.9	1495.0	друг
++1417.6	1442.0	1432.4	1495.0	к
++1447.1	1442.0	1520.9	1495.0	другу
++1535.7	1442.0	1668.5	1495.0	претензий
++1683.2	1442.0	1712.7	1495.0	не
++1727.5	1442.0	1816.0	1495.0	имеют.
++638.0	1521.0	844.0	1546.0	Арендодатель
++1919.0	1577.0	2081.0	1603.0	Арендатор
++475.0	1597.0	592.4	1644.0	Открытое
++607.1	1597.0	768.5	1644.0	акционерное
++783.2	1597.0	900.5	1644.0	общество
++915.2	1597.0	1150.0	1644.0	"Амкодор-Унимод"
++1898.0	1660.0	2043.3	1687.0	Кофевенд
++2061.5	1660.0	2116.0	1687.0	000
++184.0	1672.0	291.0	1690.0	Директор
++1140.0	1704.0	1200.5	1730.0	Кулик
++1212.6	1704.0	1261.0	1730.0	В.В.
++210.0	1757.0	294.0	1780.0	Главный
++306.0	1757.0	414.0	1780.0	бухгалтер
++1080.0	1794.0	1191.9	1815.0	Душевская
++1204.3	1794.0	1254.0	1815.0	М.Н.
++839.0	1837.0	923.0	1863.0	МИН
++805.0	1857.0	927.0	1887.0	AMMINIME.
++1932.0	2057.0	1990.0	2069.0	родно
+diff --git a/docflow/internal/recognize/totals_guard_test.go b/docflow/internal/recognize/totals_guard_test.go
+new file mode 100644
+index 0000000..5788be5
+--- /dev/null
++++ b/docflow/internal/recognize/totals_guard_test.go
+@@ -0,0 +1,95 @@
++package recognize
++
++import (
++	"strings"
++	"testing"
++
++	"docflow/internal/domain"
++)
++
++// Опознание строки итога по арифметике не должно съедать обычные позиции.
++//
++// Правило «значения строки равны суммам предыдущих» опиралось на
++// независимость граф, которой нет. Графы НДС и «всего с НДС» — линейные функции
++// базовой суммы: если совпала база, они совпадут всегда, и одно случайное
++// совпадение давало сразу три «подтверждения».
++
++// Третья позиция случайно равна сумме двух предыдущих по ВСЕМ денежным графам.
++// Так выглядит обычный счёт на аренду двух помещений плюс коммунальные услуги.
++func TestRunningTotalDoesNotEatOrdinaryRow(t *testing.T) {
++	ft := &domain.FreeTable{
++		Columns: []string{"Наименование", "Сумма", "НДС", "Всего"},
++		Roles:   []string{"name", "amount", "vat", "total"},
++		Rows: [][]string{
++			{"Аренда офиса", "100,00", "20,00", "120,00"},
++			{"Аренда склада", "100,00", "20,00", "120,00"},
++			{"Коммунальные услуги", "200,00", "40,00", "240,00"},
++		},
++	}
++	takeGarbledTotalsRow(ft)
++	if len(ft.Rows) != 3 {
++		t.Fatalf("позиций осталось %d вместо 3 — обычная строка съедена как итог: %v", len(ft.Rows), ft.Rows)
++	}
++	if len(ft.Totals) != 0 {
++		t.Errorf("итог выдуман из позиции: %q", strings.Join(ft.Totals, " "))
++	}
++}
++
++// Графа «№ п/п» и графа количества складываются «бесплатно»: 3 = 1 + 2 и
++// 2 = 1 + 1. Раньше этого хватало на два совпадения, и третья позиция
++// нумерованной накладной выбрасывалась.
++func TestServiceColumnsDoNotCountAsTotals(t *testing.T) {
++	ft := &domain.FreeTable{
++		Columns: []string{"№", "Наименование", "Кол-во", "Цена", "Сумма"},
++		Roles:   []string{"number", "name", "qty", "price", "amount"},
++		Rows: [][]string{
++			{"1", "Товар А", "1", "10,00", "10,00"},
++			{"2", "Товар Б", "1", "17,50", "17,50"},
++			{"3", "Товар В", "2", "5,00", "10,00"},
++		},
++	}
++	takeGarbledTotalsRow(ft)
++	if len(ft.Rows) != 3 {
++		t.Fatalf("позиций осталось %d вместо 3 — сработали служебные графы: %v", len(ft.Rows), ft.Rows)
++	}
++}
++
++// Настоящий итог забирается, но только с конца таблицы и только по деньгам.
++func TestRealTotalsRowTaken(t *testing.T) {
++	ft := &domain.FreeTable{
++		Columns: []string{"Наименование", "Сумма", "НДС", "Всего"},
++		Roles:   []string{"name", "amount", "vat", "total"},
++		Rows: [][]string{
++			{"Услуга А", "10,00", "2,00", "12,00"},
++			{"Услуга Б", "20,00", "4,00", "24,00"},
++			{"Услуга В", "30,00", "6,00", "36,00"},
++			{"ОТОТИ", "60,00", "12,00", "72,00"},
++		},
++	}
++	takeGarbledTotalsRow(ft)
++	if len(ft.Rows) != 3 {
++		t.Fatalf("итоговая строка осталась в позициях, сумма документа удвоится: %v", ft.Rows)
++	}
++	if !strings.Contains(strings.Join(ft.Totals, " "), "72,00") {
++		t.Errorf("итог не забран: %q", strings.Join(ft.Totals, " "))
++	}
++}
++
++// Данные не пропадают: если числовой итог уже найден по слову, вторая
++// подходящая строка остаётся позицией, а не исчезает молча.
++func TestSecondCandidateStaysAsRow(t *testing.T) {
++	ft := &domain.FreeTable{
++		Columns: []string{"Наименование", "Сумма", "НДС", "Всего"},
++		Roles:   []string{"name", "amount", "vat", "total"},
++		Totals:  []string{"Итого", "60,00", "12,00", "72,00"},
++		Rows: [][]string{
++			{"Услуга А", "10,00", "2,00", "12,00"},
++			{"Услуга Б", "20,00", "4,00", "24,00"},
++			{"Услуга В", "30,00", "6,00", "36,00"},
++		},
++	}
++	takeGarbledTotalsRow(ft)
++	if len(ft.Rows) != 3 {
++		t.Fatalf("строка исчезла при уже заполненном итоге: %v", ft.Rows)
++	}
++}
+diff --git a/docflow/internal/recognize/totals_real_test.go b/docflow/internal/recognize/totals_real_test.go
+new file mode 100644
+index 0000000..dc2afd1
+--- /dev/null
++++ b/docflow/internal/recognize/totals_real_test.go
+@@ -0,0 +1,158 @@
++package recognize
++
++import (
++	"strings"
++	"testing"
++
++	"docflow/internal/domain"
++)
++
++// Строка итога — сценарии разбора 14.09.
++//
++// Роли граф берутся из rolesFor, как в рабочем пути (роль «number» он не выдаёт
++// никогда), а сквозные сценарии идут через TableFromWords на раскладке счёта № 112.
++
++// invoice112With — счёт № 112, где слово «Итого:» заменено и снизу добавлены строки.
++func invoice112With(totalWord string, extra ...wordBox) []wordBox {
++	out := make([]wordBox, 0, 40)
++	for _, w := range invoice112() {
++		if w.Text == "Итого:" {
++			w.Text = totalWord
++		}
++		out = append(out, w)
++	}
++	return append(out, extra...)
++}
++
++func rowsContain(rows [][]string, needle string) bool {
++	for _, r := range rows {
++		if strings.Contains(strings.Join(r, " "), needle) {
++			return true
++		}
++	}
++	return false
++}
++
++// «ИТ0ГО» в таблице, ниже «Всего к оплате с НДС: 36,78». Итог по слову уже найден,
++// но изуродованная строка итога не должна остаться позицией — сумма удвоится.
++func TestGarbledTotalWithWordTotalBelow(t *testing.T) {
++	ft := TableFromWords(invoice112With("ИТ0ГО:",
++		wb("Всего", 700, 184, 40), wb("к", 745, 184, 8), wb("оплате", 758, 184, 45),
++		wb("с", 808, 184, 6), wb("НДС:", 820, 184, 30), wb("36,78", 1214, 184, 34)))
++	if ft == nil {
++		t.Fatal("таблица не собрана")
++	}
++	if len(ft.Rows) != 2 || rowsContain(ft.Rows, "36,78") {
++		t.Errorf("строка итога осталась в позициях, сумма удвоится: %q", ft.Rows)
++	}
++}
++
++// Сумма прописью без цифр под изуродованным итогом приклеивалась к нему как
++// перенос наименования, и итог превращался в «позицию с настоящим названием».
++func TestSpelledAmountNotGluedToGarbledTotal(t *testing.T) {
++	ft := TableFromWords(invoice112With("ИТ0ГО:",
++		wb("Тридцать", 700, 184, 60), wb("шесть", 765, 184, 40), wb("рублей", 810, 184, 18)))
++	if ft == nil {
++		t.Fatal("таблица не собрана")
++	}
++	if len(ft.Rows) != 2 || rowsContain(ft.Rows, "36,78") {
++		t.Errorf("итог остался позицией: %q", ft.Rows)
++	}
++	if !strings.Contains(strings.Join(ft.Totals, " "), "36,78") {
++		t.Errorf("итог не забран: %q", ft.Totals)
++	}
++}
++
++// Одинаковые позиции без графы «№»: итог сверяется по ПОЛНОМУ набору строк, до
++// схлопывания повторов, иначе 100 + 50 ≠ 250 и итог остаётся позицией.
++func TestGarbledTotalBeforeDedup(t *testing.T) {
++	ws := []wordBox{
++		wb("Наименование", 700, 100, 90), wb("Сумма", 1045, 100, 38), wb("НДС", 1160, 100, 26), wb("Всего", 1215, 100, 38),
++		wb("Аренда", 700, 132, 60), wb("100,00", 1040, 132, 42), wb("20,00", 1158, 132, 34), wb("120,00", 1212, 132, 42),
++		wb("Аренда", 700, 148, 60), wb("100,00", 1040, 148, 42), wb("20,00", 1158, 148, 34), wb("120,00", 1212, 148, 42),
++		wb("Охрана", 700, 164, 60), wb("50,00", 1044, 164, 34), wb("10,00", 1158, 164, 34), wb("60,00", 1214, 164, 34),
++		wb("ИТ0ГО", 700, 180, 45), wb("250,00", 1040, 180, 42), wb("50,00", 1158, 180, 34), wb("300,00", 1212, 180, 42),
++	}
++	ft := TableFromWords(ws)
++	if ft == nil {
++		t.Fatal("таблица не собрана")
++	}
++	if rowsContain(ft.Rows, "300,00") {
++		t.Errorf("итог остался позицией: %q", ft.Rows)
++	}
++}
++
++// Графа «№ п/п» получает от rolesFor роль index — и не должна считаться деньгами:
++// 3 = 1 + 2 давало бесплатное совпадение, и третья позиция уходила в итог.
++func TestIndexColumnIsNotMoney(t *testing.T) {
++	cols := []string{"№", "Наименование", "Кол-во", "Цена", "Сумма"}
++	ft := &domain.FreeTable{
++		Columns: cols,
++		Roles:   rolesFor(cols),
++		Rows: [][]string{
++			{"1", "Газ", "1", "10,00", "10,00"},
++			{"2", "Свет", "1", "17,50", "17,50"},
++			{"3", "", "2", "13,75", "27,50"},
++		},
++	}
++	takeGarbledTotalsRow(ft)
++	if len(ft.Rows) != 3 {
++		t.Errorf("позиция съедена как итог (роли %v): %q", ft.Roles, ft.Rows)
++	}
++}
++
++// Однословное наименование — настоящее, даже короткое.
++func TestOneWordItemIsRealName(t *testing.T) {
++	cols := []string{"Наименование", "Сумма", "НДС", "Всего"}
++	ft := &domain.FreeTable{
++		Columns: cols,
++		Roles:   rolesFor(cols),
++		Rows: [][]string{
++			{"Вода", "40,00", "8,00", "48,00"},
++			{"Стоки", "25,00", "5,00", "30,00"},
++			{"Теплоэнергия", "65,00", "13,00", "78,00"},
++		},
++	}
++	takeGarbledTotalsRow(ft)
++	if len(ft.Rows) != 3 {
++		t.Errorf("позиция «Теплоэнергия» съедена как итог: %q", ft.Rows)
++	}
++}
++
++// Изуродованный итог с хвостом «по счёту» — не наименование.
++func TestGarbledTotalWithTail(t *testing.T) {
++	cols := []string{"Наименование", "Сумма", "НДС", "Всего"}
++	ft := &domain.FreeTable{
++		Columns: cols,
++		Roles:   rolesFor(cols),
++		Rows: [][]string{
++			{"Вода", "10,00", "2,00", "12,00"},
++			{"Стоки", "20,65", "4,13", "24,78"},
++			{"ИТ0Г0 по счёту", "30,65", "6,13", "36,78"},
++		},
++	}
++	takeGarbledTotalsRow(ft)
++	if len(ft.Rows) != 2 {
++		t.Errorf("итог с хвостом остался позицией: %q", ft.Rows)
++	}
++}
++
++// Итог по слову уже есть и с изуродованной строкой НЕ совпадает — строка
++// остаётся позицией: данные не пропадают молча.
++func TestOccupiedTotalsMismatchKeepsRow(t *testing.T) {
++	cols := []string{"Наименование", "Сумма", "НДС", "Всего"}
++	ft := &domain.FreeTable{
++		Columns: cols,
++		Roles:   rolesFor(cols),
++		Totals:  []string{"Итого", "99,00", "19,80", "118,80"},
++		Rows: [][]string{
++			{"Вода", "10,00", "2,00", "12,00"},
++			{"Стоки", "20,65", "4,13", "24,78"},
++			{"ИТ0ГО", "30,65", "6,13", "36,78"},
++		},
++	}
++	takeGarbledTotalsRow(ft)
++	if len(ft.Rows) != 3 {
++		t.Errorf("строка исчезла при несовпадающем итоге: %q", ft.Rows)
++	}
++}
+diff --git a/docflow/internal/recognize/totals_words.go b/docflow/internal/recognize/totals_words.go
+new file mode 100644
+index 0000000..60dd18c
+--- /dev/null
++++ b/docflow/internal/recognize/totals_words.go
+@@ -0,0 +1,144 @@
++package recognize
++
++import (
++	"math"
++	"strings"
++	"unicode"
++)
++
++// Слова строки итога: что считать изуродованным «ИТОГО», что — хвостом итоговой
++// строки, а что — настоящим наименованием позиции.
++
++// хвосты итоговой строки: «ИТОГО по счёту», «Всего с НДС», «Итого к оплате»
++var totalsTailWords = map[string]bool{
++	"счету": true, "счет": true, "документу": true, "накладной": true, "акту": true,
++	"оплате": true, "оплату": true, "сумма": true, "сумму": true, "ндс": true,
++	"руб": true, "byn": true, "бел": true, "числе": true, "том": true, "без": true,
++	"итого": true, "всего": true, "итог": true, "листу": true, "странице": true,
++}
++
++// isNameWord — слово годится в наименование позиции.
++func isNameWord(w string) bool {
++	w = strings.TrimSpace(w)
++	// «ИТ0ГО:36,78» — сумма приклеилась к слову итога; «|ИТ0ГО» — рамка графы
++	if i := strings.IndexAny(w, ":;"); i > 0 {
++		w = w[:i]
++	}
++	w = strings.TrimFunc(w, func(r rune) bool { return !unicode.IsLetter(r) && r != '0' })
++	letters := 0
++	for _, r := range w {
++		if unicode.IsLetter(r) {
++			letters++
++		}
++	}
++	if letters < 3 {
++		return false
++	}
++	norm := strings.ReplaceAll(strings.ToLower(latinLookalikes.Replace(w)), "ё", "е")
++	if totalsTailWords[norm] || isGarbledTotalWord(norm) {
++		return false
++	}
++	return true
++}
++
++// isGarbledTotalWord — «ИТОГО», изуродованное распознаванием: «ИТ0ГО» (ноль
++// вместо О), «ОТОТИ» (буквы переставлены, одна заменена). Сравниваем по набору
++// букв, а не по порядку: переставляет распознавание постоянно.
++//
++// Огрызок бывает и не из пяти букв («ИТГО», «ИТОГ0О», «ИТ0Г»), и от
++// «ВСЕГО» латиницей («Bcero»: латинская r вместо г — одна заменённая буква, её
++// покрывает допуск). Длина 4-6, сравнение с обоими словами.
++var totalWordLookalikes = strings.NewReplacer("0", "о")
++
++func isGarbledTotalWord(norm string) bool {
++	norm = totalWordLookalikes.Replace(norm)
++	if norm == "итого" || norm == "всего" || norm == "итог" {
++		return true
++	}
++	n := len([]rune(norm))
++	if n < 4 || n > 6 {
++		return false
++	}
++	// одна заменённая буква даёт расхождение в 2 (одной не хватает, одна лишняя),
++	// пропущенная или лишняя — в 1
++	return letterDiff(norm, "итого") <= 2 || letterDiff(norm, "всего") <= 2
++}
++
++func letterDiff(a, b string) int {
++	count := map[rune]int{}
++	for _, r := range b {
++		count[r]++
++	}
++	for _, r := range a {
++		count[r]--
++	}
++	diff := 0
++	for _, v := range count {
++		if v < 0 {
++			v = -v
++		}
++		diff += v
++	}
++	return diff
++}
++
++// Сумма прописью: числительное словом и «рубл»/«копе» в одной строке.
++var spelledNumeralPrefixes = []string{
++	"один", "одна", "одно", "два", "две", "три", "четыр", "пят", "шест", "сем",
++	"восем", "девят", "десят", "одиннадц", "двенадц", "двадцат", "тридцат",
++	"сорок", "пятьдес", "шестьдес", "семьдес", "восемьдес", "девяност", "двест",
++	"трист", "четырест", "пятьсот", "шестьсот", "семьсот", "восемьсот",
++	"девятьсот", "тысяч", "миллион",
++}
++
++func isSpelledAmount(s string) bool {
++	numeral, currency := false, false
++	for _, f := range strings.Fields(strings.ToLower(s)) {
++		f = strings.Trim(f, ".,:;«»\"'()")
++		if strings.HasPrefix(f, "рубл") || strings.HasPrefix(f, "копе") {
++			currency = true
++			continue
++		}
++		if f == "сто" {
++			numeral = true
++			continue
++		}
++		for _, p := range spelledNumeralPrefixes {
++			if strings.HasPrefix(f, p) {
++				numeral = true
++				break
++			}
++		}
++	}
++	return numeral && currency
++}
++
++// sharesMoney — в двух строках есть одна и та же денежная сумма.
++func sharesMoney(a, b []string) bool {
++	var av []float64
++	for _, c := range a {
++		for _, f := range strings.Fields(c) {
++			f = strings.Trim(f, ":;")
++			if reMoneyWritten.MatchString(f) {
++				if v, ok := cellNumber(f); ok && v > 0 {
++					av = append(av, v)
++				}
++			}
++		}
++	}
++	for _, c := range b {
++		if !reMoneyWritten.MatchString(strings.TrimSpace(c)) {
++			continue
++		}
++		v, ok := cellNumber(c)
++		if !ok || v <= 0 {
++			continue
++		}
++		for _, x := range av {
++			if math.Abs(x-v) < 0.005 {
++				return true
++			}
++		}
++	}
++	return false
++}

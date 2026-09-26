@@ -1,0 +1,747 @@
+"""
+Surya OCR — локальный HTTP-сервис распознавания.
+
+text — раскладка восстановлена по координатам (колонки, пустые строки между
+блоками); flat — построчный текст как раньше, для регулярок в extract.go.
+"""
+import io
+import os
+import threading
+import time
+from contextlib import asynccontextmanager
+from statistics import median
+
+from fastapi import FastAPI, File, UploadFile
+from fastapi.responses import JSONResponse
+from PIL import Image
+
+_THREADS = os.getenv("OCR_THREADS", "").strip()
+if _THREADS:
+    os.environ.setdefault("OMP_NUM_THREADS", _THREADS)
+    os.environ.setdefault("MKL_NUM_THREADS", _THREADS)
+os.environ.setdefault("TORCH_DEVICE", "cpu")
+
+# Детектор таблиц — третья модель, ей нужна память. Выключается без
+# пересборки: SURYA_TABLE_REC=0. Если модель не поднялась, сервис работает
+# как раньше, только без поля tables.
+_TABLE_REC = os.getenv("SURYA_TABLE_REC", "1").strip() not in ("0", "false", "no")
+
+_COL_GAP = float(os.getenv("SURYA_COL_GAP", "8"))
+_ROW_FACTOR = float(os.getenv("SURYA_ROW_FACTOR", "0.6"))
+_GAP_FACTOR = float(os.getenv("SURYA_GAP_FACTOR", "1.2"))
+
+# Подробный разбор регионов пишется в лог только по SURYA_DEBUG=1: на потоке
+# он забивает журнал контейнера построчной распечаткой каждой страницы.
+_DEBUG = os.getenv("SURYA_DEBUG", "0").strip() not in ("0", "false", "no", "")
+
+
+def _dbg(*a, **kw):
+    # Вызовы перенесены из print и несут flush=True — принимаем любые
+    # именованные аргументы и передаём их дальше, чтобы не править места вызова.
+    if _DEBUG:
+        kw.setdefault("flush", True)
+        print(*a, **kw)
+
+_state = {"ready": False, "error": None}
+_lock = threading.Lock()
+_models = {}
+
+
+def _load_models():
+    import torch
+    from surya.foundation import FoundationPredictor
+    from surya.recognition import RecognitionPredictor
+    from surya.detection import DetectionPredictor
+
+    if _THREADS:
+        try:
+            torch.set_num_threads(int(_THREADS))
+        except Exception:
+            pass
+
+    foundation = FoundationPredictor()
+    _models["foundation"] = foundation
+    _models["recognition"] = RecognitionPredictor(foundation)
+    _models["detection"] = DetectionPredictor()
+
+    # Отсутствие детектора таблиц — не повод ронять весь OCR: распознавание
+    # текста важнее, а таблица в худшем случае соберётся прежним способом.
+    if _TABLE_REC:
+        try:
+            from surya.table_rec import TableRecPredictor
+
+            _models["table_rec"] = TableRecPredictor()
+        except Exception as exc:  # noqa: BLE001
+            _state["table_rec_error"] = str(exc)
+
+        # Layout нужен, чтобы найти на странице саму таблицу: детектор ячеек
+        # работает по одной таблице, а не по листу целиком.
+        # Сигнатура LayoutPredictor разошлась между версиями surya: где-то он
+        # строится поверх foundation-модели, где-то создаётся сам. Пробуем оба
+        # варианта, чтобы патч не привязывался к конкретной версии пакета.
+        try:
+            from surya.layout import LayoutPredictor
+
+            try:
+                _models["layout"] = LayoutPredictor(foundation)
+            except TypeError:
+                _models["layout"] = LayoutPredictor()
+        except Exception as exc:  # noqa: BLE001
+            _state["layout_error"] = str(exc)
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    try:
+        _load_models()
+        _state["ready"] = True
+    except Exception as exc:
+        _state["error"] = str(exc)
+    yield
+
+
+app = FastAPI(title="DocFlow Surya OCR", lifespan=lifespan)
+
+
+def _row_metrics(row):
+    """Высота строки и ширина символа по боксам самой строки.
+
+    Считать их по всей странице нельзя: заголовок документа набран кеглем
+    втрое крупнее таблицы и утягивает медиану вверх, из-за чего зазоры внутри
+    таблицы кажутся меньше порога и колонки склеиваются.
+    """
+    h = median([b[3] - b[1] for _, b in row]) or 1.0
+    cw = median([(b[2] - b[0]) / max(len(t), 1) for t, b in row])
+    return h, max(cw, 1.0)
+
+
+def _group_rows(items, row_factor):
+    """Строка — боксы, перекрывающиеся по вертикали.
+
+    Прежняя версия сравнивала верх бокса с верхом ПЕРВОГО элемента строки и
+    больше его не двигала: на длинной таблице строка дрейфовала и затягивала
+    соседний ряд. Перекрытие — устойчивее: оно не зависит ни от порядка
+    обхода, ни от того, насколько ячейки съехали по базовой линии.
+    """
+    items = sorted(items, key=lambda it: (it[1][1], it[1][0]))
+    rows = []
+    for txt, b in items:
+        placed = False
+        for row in rows:
+            top = min(x[1][1] for x in row)
+            bottom = max(x[1][3] for x in row)
+            height = max(bottom - top, 1.0)
+            overlap = min(bottom, b[3]) - max(top, b[1])
+            # Порог задаётся долей высоты уже собранной строки, а не медианой
+            # по странице: у таблицы своя высота, у реквизитов своя.
+            if overlap > height * row_factor:
+                row.append((txt, b))
+                placed = True
+                break
+        if not placed:
+            rows.append([(txt, b)])
+    rows.sort(key=lambda row: min(x[1][1] for x in row))
+    return rows
+
+
+def _layout_items(items) -> str:
+    if not items:
+        return ""
+
+    # row_factor здесь — доля ПЕРЕКРЫТИЯ, а не доля высоты: 0.3 значит, что
+    # боксы считаются одной строкой, если перекрываются хотя бы на треть.
+    row_factor = min(max(_ROW_FACTOR, 0.05), 0.9)
+    rows = _group_rows(items, row_factor)
+
+    page_h = median([b[3] - b[1] for _, b in items]) or 1.0
+    page_cw = max(median([(b[2] - b[0]) / max(len(t), 1) for t, b in items]), 1.0)
+
+    out, prev_bottom = [], None
+    for row in rows:
+        row.sort(key=lambda it: it[1][0])
+        _, cw = _row_metrics(row)
+        top = min(b[1] for _, b in row)
+        if prev_bottom is not None and top - prev_bottom > page_h * _GAP_FACTOR:
+            out.append("")
+
+        buf, prev_right = "", None
+        for txt, b in row:
+            if prev_right is not None:
+                gap = b[0] - prev_right
+                # Зазор меряем шириной символа ЭТОЙ строки. В таблице шрифт
+                # мельче, поэтому её колонки разделяются там, где по меркам
+                # страницы разрыва как будто нет.
+                if gap > cw * _COL_GAP:
+                    buf += " | "
+                elif buf and not buf.endswith(" "):
+                    buf += "  "
+            # Отступ слева сохраняем в масштабе страницы: так столбцы разных
+            # блоков остаются визуально на своих местах.
+            col = int(b[0] / page_cw)
+            if col > len(buf):
+                buf += " " * (col - len(buf))
+            buf += txt
+            prev_right = b[2]
+
+        out.append(buf.rstrip())
+        prev_bottom = max(b[3] for _, b in row)
+
+    return "\n".join(out)
+
+
+import re as _re
+
+_MATH_TAG = _re.compile(r"<math[^>]*>.*?</math>", _re.S)
+_TEX_MACRO = _re.compile(r"\\[a-zA-Z]+\s*")
+
+
+def _clean_text(t: str) -> str:
+    """Убирает разметку формул.
+
+    surya печатает «№ п/п» разметкой LaTeX внутри тега math: включён math_mode.
+    Такая подпись уезжает в заголовок графы, а оттуда в 1С. Разметку сворачиваем
+    в «№» — по смыслу это именно он.
+    """
+    if not t:
+        return ""
+    if "<math" in t or "\\" in t:
+        t = _MATH_TAG.sub(" № ", t)
+        t = _TEX_MACRO.sub(" ", t)
+        t = t.replace("{", " ").replace("}", " ").replace("$", " ")
+    return " ".join(t.split())
+
+
+def _words_from_line(txt, bbox, words_attr=None):
+    """Слова строки с координатами.
+
+    Если распознаватель вернул слова сам (return_words), берём их. Если нет —
+    режем бокс строки пропорционально длине слов в символах. Это приближение,
+    но графы в бланке шире одного символа, и для раскладки по колонкам его
+    хватает; главное, что цифра из графы «Цена» перестаёт считаться частью той
+    же сущности, что и цифра из графы «Сумма».
+    """
+    out = []
+    if words_attr:
+        for w in words_attr:
+            wt = _clean_text(getattr(w, "text", "") or "")
+            wb = getattr(w, "bbox", None)
+            if not wt or not wb or len(wb) < 4:
+                continue
+            out.append((wt, [float(v) for v in wb[:4]]))
+        if out:
+            return out
+
+    parts = txt.split()
+    if not parts:
+        return []
+    x0, y0, x1, y1 = bbox
+    width = max(x1 - x0, 1.0)
+    total = sum(len(p) for p in parts) + max(len(parts) - 1, 0)
+    per = width / max(total, 1)
+    cur = x0
+    for p in parts:
+        w = len(p) * per
+        out.append((p, [cur, y0, cur + w, y1]))
+        cur += w + per  # пробел между словами
+    return out
+
+
+def _poly_bbox(poly):
+    """PolygonBox отдаёт четыре точки; нам нужен прямоугольник."""
+    if not poly:
+        return [0.0, 0.0, 0.0, 0.0]
+    xs = [float(pt[0]) for pt in poly]
+    ys = [float(pt[1]) for pt in poly]
+    return [min(xs), min(ys), max(xs), max(ys)]
+
+
+def _text_in_box(words, box, min_overlap=0.45):
+    """Текст ячейки — слова, чей центр лежит внутри неё.
+
+    Раньше сюда приходили строки OCR целиком: строка таблицы — один бокс, и в
+    отдельную графу она по доле площади не помещалась. Ячейки оставались
+    пустыми, а если строка всё же проходила порог — она попадала в самую
+    широкую графу и повторялась по всему ряду. По словам этой развилки нет:
+    слово целиком принадлежит одной графе, и центр однозначно её называет.
+    """
+    x0, y0, x1, y1 = box
+    picked = []
+    for txt, b in words:
+        cx = (b[0] + b[2]) / 2.0
+        cy = (b[1] + b[3]) / 2.0
+        if x0 <= cx <= x1 and y0 <= cy <= y1:
+            picked.append((b[1], b[0], txt))
+    picked.sort()
+    return " ".join(t for _, _, t in picked).strip()
+
+
+def _lines_from_items(items, tol=0.6):
+    """OCR-боксы, сгруппированные в строки по вертикальному перекрытию."""
+    boxes = sorted(((b, t) for t, b in items), key=lambda pair: pair[0][1])
+    lines = []
+    for b, t in boxes:
+        h = max(b[3] - b[1], 1.0)
+        placed = False
+        for ln in lines:
+            ov = min(ln["y1"], b[3]) - max(ln["y0"], b[1])
+            if ov > tol * min(h, max(ln["y1"] - ln["y0"], 1.0)):
+                ln["items"].append((b, t))
+                ln["y0"] = min(ln["y0"], b[1])
+                ln["y1"] = max(ln["y1"], b[3])
+                placed = True
+                break
+        if not placed:
+            lines.append({"y0": b[1], "y1": b[3], "items": [(b, t)]})
+    lines.sort(key=lambda ln: ln["y0"])
+    return lines
+
+
+def _table_region_from_text(items, image, min_cols=3, min_rows=2):
+    """Область таблицы по геометрии OCR-строк.
+
+    Layout-модель на сканах бланков часто не выделяет метку Table и отдаёт
+    страницу одним блоком Text. Тогда таблицу ищем сами: её строки состоят из
+    нескольких боксов, разнесённых по горизонтали, и идут подряд. Берём самый
+    длинный такой участок — это и есть табличная часть.
+    """
+    lines = _lines_from_items(items)
+    flags = [len(ln["items"]) >= min_cols for ln in lines]
+
+    # Все подряд идущие участки многоколоночных строк — кандидаты. Рамка с
+    # реквизитами поставщика тоже такой участок, поэтому единственный «самый
+    # длинный» выбирать нельзя: отдаём все, а нужную таблицу выберет
+    # приёмник по числу заполненных ячеек.
+    runs = []
+    i = 0
+    while i < len(flags):
+        if not flags[i]:
+            i += 1
+            continue
+        j = i
+        while j + 1 < len(flags) and flags[j + 1]:
+            j += 1
+        if j - i + 1 >= min_rows:
+            runs.append((i, j))
+        i = j + 1
+    if not runs:
+        return []
+
+    # Шапка и «Итого» разбиты на меньшее число боксов и в непрерывный
+    # участок не попадают: заголовок — из-за многословных названий граф,
+    # итоговая строка — из-за пустых клеток. Дотягиваем участок вверх и вниз,
+    # пока соседние строки лежат в тех же горизонтальных границах таблицы.
+    def _grow(a, b):
+        sel = lines[a:b + 1]
+        gx0 = min(bx[0] for ln in sel for bx, _ in ln["items"])
+        gx1 = max(bx[2] for ln in sel for bx, _ in ln["items"])
+        # Шапка часто разбита на обрывки в один бокс («ндс %» под «Ставка»),
+        # поэтому считать перехлёст по ширине нельзя — обрывок узкий. Зато он
+        # целиком лежит внутри горизонтальных границ таблицы, а посторонний
+        # текст под ней («Всего наименований») вылезает за край и рост
+        # останавливает. Плюс ограничение по вертикальному зазору и по числу
+        # добираемых строк, чтобы не утянуть половину листа.
+        pitch = max((lines[k + 1]["y0"] - lines[k]["y0"]) for k in range(a, b)) if b > a else 60.0
+        limit = 2.0 * max(pitch, 20.0)
+
+        def inside(ln):
+            xs0 = min(bx[0] for bx, _ in ln["items"])
+            xs1 = max(bx[2] for bx, _ in ln["items"])
+            return xs0 >= gx0 - 12.0 and xs1 <= gx1 + 12.0
+
+        for _ in range(3):
+            if a == 0:
+                break
+            cand = lines[a - 1]
+            if lines[a]["y0"] - cand["y0"] > limit or not inside(cand):
+                break
+            a -= 1
+        for _ in range(2):
+            if b + 1 >= len(lines):
+                break
+            cand = lines[b + 1]
+            if cand["y0"] - lines[b]["y0"] > limit or not inside(cand):
+                break
+            b += 1
+        return a, b
+
+    for _a, _b in runs:
+        for _k in range(max(0,_a-3), min(len(lines), _b+4)):
+            _ln = lines[_k]
+            _dbg("LINE", _k, "n=", len(_ln["items"]), "y=", round(_ln["y0"]),
+                  "x=", round(min(bx[0] for bx,_ in _ln["items"])),
+                  round(max(bx[2] for bx,_ in _ln["items"])),
+                  "|".join(t for _,t in _ln["items"])[:80], flush=True)
+    runs = [_grow(a, b) for a, b in runs]
+    runs.sort(key=lambda r: r[1] - r[0], reverse=True)
+    pad = 8.0
+    out = []
+    for a, b in runs[:5]:
+        sel = lines[a:b + 1]
+        x0 = min(bx[0] for ln in sel for bx, _ in ln["items"])
+        y0 = min(bx[1] for ln in sel for bx, _ in ln["items"])
+        x1 = max(bx[2] for ln in sel for bx, _ in ln["items"])
+        y1 = max(bx[3] for ln in sel for bx, _ in ln["items"])
+        out.append((max(x0 - pad, 0.0), max(y0 - pad, 0.0),
+                    min(x1 + pad, float(image.width)),
+                    min(y1 + pad, float(image.height))))
+    return out
+
+
+
+def _looks_like_totals(by_col, spans):
+    """Похожа ли строка под таблицей на строку итогов.
+
+    Берём её, только если хотя бы в одной из правых (денежных) граф стоит
+    число и текста в строке немного. Строка «К оплате 0.04 (Ноль белорусских
+    рублей 04 копейки)» это условие не проходит: число в ней есть, но лежит в
+    левой графе вместе с длинным текстом прописью.
+    """
+    if not by_col or not spans:
+        return False
+
+    cols = sorted(spans.keys())
+    if len(cols) < 3:
+        return False
+    # Денежные графы — правая треть таблицы: сумма без НДС, НДС, всего.
+    money_cols = set(cols[len(cols) * 2 // 3:])
+
+    money_hit = False
+    for col, texts in by_col.items():
+        joined = " ".join(texts).strip()
+        if not joined:
+            continue
+        has_digit = any(ch.isdigit() for ch in joined)
+        letters = sum(1 for ch in joined if ch.isalpha())
+        if col in money_cols and has_digit and letters <= 4:
+            money_hit = True
+        # Длинный текст в любой графе — это подпись или сумма прописью,
+        # а не итог: в строке итогов ячейки короткие.
+        if len(joined) > 40:
+            return False
+    return money_hit
+
+
+def _table_regions(image, items):
+    """Области страницы, размеченные как таблица.
+
+    Если layout-модель недоступна или ничего не нашла, возвращаем страницу
+    целиком: хуже, чем кроп, но лучше, чем ничего — на бланке, где кроме
+    таблицы почти ничего нет, разметка всё равно получится осмысленной.
+    """
+    predictor = _models.get("layout")
+    if predictor is None:
+        return [(0.0, 0.0, float(image.width), float(image.height))]
+    try:
+        result = predictor([image])[0]
+    except Exception as exc:  # noqa: BLE001
+        _state["layout_error"] = str(exc)
+        return [(0.0, 0.0, float(image.width), float(image.height))]
+
+    regions = []
+    for box in getattr(result, "bboxes", None) or []:
+        label = (getattr(box, "label", "") or "").lower()
+        if "table" not in label:
+            continue
+        bb = getattr(box, "bbox", None)
+        if not bb or len(bb) < 4:
+            continue
+        x0, y0, x1, y1 = (float(v) for v in bb[:4])
+        # Небольшой запас по краям: рамка таблицы иногда обрезает крайние
+        # символы, и тогда первая или последняя колонка теряет значения.
+        pad = 4.0
+        regions.append((
+            max(x0 - pad, 0.0),
+            max(y0 - pad, 0.0),
+            min(x1 + pad, float(image.width)),
+            min(y1 + pad, float(image.height)),
+        ))
+    _dbg("LAYOUT labels:", [(getattr(b,"label",None), getattr(b,"bbox",None)) for b in (getattr(result,"bboxes",None) or [])], flush=True)
+    _dbg("LAYOUT regions:", regions, "page:", image.width, image.height, flush=True)
+    if not regions:
+        regions = _table_region_from_text(items, image)
+        _dbg("LAYOUT: Table не найден, регион по строкам:", regions, flush=True)
+    if not regions:
+        _dbg("LAYOUT: откат на всю страницу", flush=True)
+        return [(0.0, 0.0, float(image.width), float(image.height))]
+    return regions
+
+
+def _attach_header_and_totals(cells, items, words, image, max_head=3):
+    """Дописывает к сетке шапку сверху и итоговую строку снизу.
+
+    table_rec размечает только тело таблицы: заголовок отделён от данных
+    линовкой и вертикальным зазором, поэтому строкой таблицы он не считается,
+    а «Итого» с пустыми клетками — тем более. В результате графы приезжают без
+    названий, роли им назначаются вслепую по позиции, и «Сумма с НДС» встаёт
+    на место «Суммы».
+
+    Обе строки OCR при этом видит. Берём их сами: колонки известны из сетки,
+    поэтому каждый бокс кладём в ту графу, с которой он пересекается сильнее
+    всего. Чужой текст под таблицей отсекается по горизонтальным границам —
+    он выходит за край, тогда как ячейки таблицы всегда внутри.
+    """
+    if not cells:
+        return cells
+
+    spans = {}
+    for c in cells:
+        x0, y0, x1, y1 = c["bbox"]
+        col = c["col"]
+        if col in spans:
+            spans[col] = (min(spans[col][0], x0), max(spans[col][1], x1))
+        else:
+            spans[col] = (x0, x1)
+    if not spans:
+        return cells
+
+    tx0 = min(v[0] for v in spans.values())
+    tx1 = max(v[1] for v in spans.values())
+    ty0 = min(c["bbox"][1] for c in cells)
+    ty1 = max(c["bbox"][3] for c in cells)
+    rows_y = sorted({round(c["bbox"][1]) for c in cells})
+    pitch = max((rows_y[i + 1] - rows_y[i]) for i in range(len(rows_y) - 1)) if len(rows_y) > 1 else 60.0
+    limit = 2.5 * max(pitch, 20.0)
+
+    def inside(ln):
+        xs0 = min(b[0] for b, _ in ln["items"])
+        xs1 = max(b[2] for b, _ in ln["items"])
+        return xs0 >= tx0 - 15.0 and xs1 <= tx1 + 15.0
+
+    def to_cols(ln):
+        by_col = {}
+        for b, t in sorted(ln["items"], key=lambda pair: pair[0][0]):
+            best, best_ov = None, 0.0
+            for col, (cx0, cx1) in spans.items():
+                ov = min(cx1, b[2]) - max(cx0, b[0])
+                if ov > best_ov:
+                    best, best_ov = col, ov
+            if best is None:
+                continue
+            by_col.setdefault(best, []).append(t)
+        return by_col
+
+    # Строки собираем из СЛОВ: to_cols раскладывает их по графам, а строка
+    # целиком легла бы в одну графу — шапка получалась бы из одной подписи.
+    lines = _lines_from_items(words)
+    above = [ln for ln in lines if ln["y1"] <= ty0 + 4.0 and ty0 - ln["y0"] < limit and inside(ln)]
+    below = [ln for ln in lines if ln["y0"] >= ty1 - 4.0 and ln["y0"] - ty1 < limit and inside(ln)]
+
+    out = [dict(c, row=c["row"] + 1, header=False) for c in cells]
+    max_row = max(c["row"] for c in out)
+
+    if above:
+        merged = {}
+        for ln in sorted(above, key=lambda l: l["y0"])[-max_head:]:
+            for col, texts in to_cols(ln).items():
+                merged.setdefault(col, []).extend(texts)
+        # Над таблицей не обязательно шапка. На счетах там стоит блок
+        # реквизитов покупателя: длинный текст, который целиком ложится в
+        # одну графу и растягивается детектором на всю ширину. Приклеив его
+        # как шапку, мы задвигаем настоящие подписи граф в строки данных.
+        # Признак настоящей шапки простой: подписи короткие и их несколько.
+        filled = [c for c, t in merged.items() if " ".join(t).strip()]
+        longest = max((len(" ".join(t).strip()) for t in merged.values()), default=0)
+        if len(filled) < 2 or longest > 60:
+            _dbg("HEADER: строка над таблицей не похожа на шапку, пропускаю:",
+                 filled, longest, flush=True)
+            merged = {}
+        if merged:
+            for col, (cx0, cx1) in spans.items():
+                out.append({
+                    "row": 0, "col": col, "rowspan": 1, "colspan": 1, "header": True,
+                    "text": " ".join(merged.get(col, [])).strip(),
+                    "bbox": [cx0, ty0 - pitch, cx1, ty0],
+                })
+        else:
+            out = [dict(c, row=c["row"] - 1) for c in out]
+    else:
+        out = [dict(c, row=c["row"] - 1) for c in out]
+
+    if below:
+        ln = sorted(below, key=lambda l: l["y0"])[0]
+        by_col = to_cols(ln)
+        # Под таблицей стоит не только «Итого». Там же «К оплате 0.04 (Ноль
+        # белорусских рублей 04 копейки)», подписи и печать — их обрывки
+        # («АРСТВ») детектор раскладывал по графам, и строка вставала в
+        # таблицу как позиция. Признак настоящего итога: числа лежат в
+        # правых, денежных графах, а не размазаны по всей ширине текстом.
+        if by_col and not _looks_like_totals(by_col, spans):
+            _dbg("TOTALS: строка под таблицей не похожа на итог, пропускаю:",
+                 {c: " ".join(t)[:40] for c, t in by_col.items()}, flush=True)
+            by_col = {}
+        if by_col:
+            max_row = max(c["row"] for c in out)
+            for col, (cx0, cx1) in spans.items():
+                out.append({
+                    "row": max_row + 1, "col": col, "rowspan": 1, "colspan": 1, "header": False,
+                    "text": " ".join(by_col.get(col, [])).strip(),
+                    "bbox": [cx0, ty1, cx1, ty1 + pitch],
+                })
+
+    out.sort(key=lambda c: (c["row"], c["col"]))
+    return out
+
+
+def _table_cells(image, items, words):
+    """Таблицы страницы как сетка: [{cells: [{row, col, text, header}]}].
+
+    Пустой список — детектор выключен, не загрузился или таблиц нет.
+    """
+    predictor = _models.get("table_rec")
+    if predictor is None:
+        return []
+
+    regions = _table_regions(image, items)
+    crops, offsets = [], []
+    for x0, y0, x1, y1 in regions:
+        if x1 - x0 < 20 or y1 - y0 < 20:
+            continue
+        crops.append(image.crop((int(x0), int(y0), int(x1), int(y1))))
+        offsets.append((x0, y0))
+    if not crops:
+        return []
+
+    try:
+        results = predictor(crops)
+    except Exception as exc:  # noqa: BLE001
+        _state["table_rec_error"] = str(exc)
+        return []
+
+    tables = []
+    for res, crop, (off_x, off_y) in zip(results or [], crops, offsets):
+        cells = getattr(res, "cells", None) or []
+        if not cells:
+            continue
+
+        # Полигоны заданы относительно image_bbox входа детектора. Обычно он
+        # совпадает с кропом, но если модель масштабировала картинку, без
+        # пересчёта ячейки разъедутся относительно текста.
+        sx = sy = 1.0
+        ib = getattr(res, "image_bbox", None)
+        if ib and len(ib) >= 4:
+            w = float(ib[2]) - float(ib[0])
+            h = float(ib[3]) - float(ib[1])
+            if w > 1 and h > 1:
+                sx = crop.width / w
+                sy = crop.height / h
+
+        out = []
+        for c in cells:
+            row_id = getattr(c, "row_id", None)
+            col_id = getattr(c, "col_id", None)
+            if row_id is None or col_id is None:
+                continue
+            x0, y0, x1, y1 = _poly_bbox(getattr(c, "polygon", None))
+            box = [
+                x0 * sx + off_x,
+                y0 * sy + off_y,
+                x1 * sx + off_x,
+                y1 * sy + off_y,
+            ]
+            out.append({
+                "row": int(row_id),
+                "col": int(col_id),
+                "rowspan": int(getattr(c, "rowspan", 1) or 1),
+                "colspan": int(getattr(c, "colspan", 1) or 1),
+                "header": bool(getattr(c, "is_header", False)),
+                "text": _text_in_box(words, box),
+                "bbox": [round(v, 1) for v in box],
+            })
+        if out:
+            out = _attach_header_and_totals(out, items, words, image)
+            tables.append({"cells": out})
+    return tables
+
+
+def _extract_text(image: Image.Image):
+    rec = _models["recognition"]
+    det = _models["detection"]
+
+    # return_words даёт координаты каждого слова, math_mode=False убирает
+    # LaTeX в подписях граф. Обоих аргументов нет в старых версиях surya —
+    # тогда откатываемся на прежний вызов, а слова досчитываем сами.
+    predictions = None
+    for kwargs in ({"return_words": True, "math_mode": False},
+                   {"return_words": True},
+                   {"math_mode": False},
+                   {}):
+        try:
+            predictions = rec([image], det_predictor=det, **kwargs)
+            break
+        except TypeError:
+            continue
+    if predictions is None:
+        predictions = rec([image], det_predictor=det)
+    if not predictions:
+        return "", "", 0, [], []
+
+    lines = getattr(predictions[0], "text_lines", None) or []
+    items, words = [], []
+    for line in lines:
+        txt = _clean_text((getattr(line, "text", "") or "").strip())
+        if not txt:
+            continue
+        bbox = getattr(line, "bbox", None) or [0, 0, 0, 0]
+        bbox = [float(v) for v in bbox[:4]]
+        items.append((txt, bbox))
+        words.extend(_words_from_line(txt, bbox, getattr(line, "words", None)))
+
+    flat = [t for t, _ in sorted(items, key=lambda it: (it[1][1], it[1][0]))]
+    tables = _table_cells(image, items, words)
+    boxes = [{"text": t, "bbox": [round(v, 1) for v in b]} for t, b in words]
+    return _layout_items(items), "\n".join(flat), len(flat), tables, boxes
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok" if _state["ready"] else "loading",
+        "ready": _state["ready"],
+        "error": _state["error"],
+        "table_rec": "table_rec" in _models,
+        "layout": "layout" in _models,
+        "layout_error": _state.get("layout_error"),
+        "table_rec_error": _state.get("table_rec_error"),
+    }
+
+
+@app.post("/ocr")
+async def ocr(file: UploadFile = File(...)):
+    if not _state["ready"]:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "models not ready: " + (_state["error"] or "still loading")},
+        )
+
+    raw = await file.read()
+    try:
+        image = Image.open(io.BytesIO(raw)).convert("RGB")
+    except Exception as exc:
+        return JSONResponse(status_code=400, content={"error": f"bad image: {exc}"})
+
+    started = time.time()
+    with _lock:
+        try:
+            text, flat, n, tables, boxes = _extract_text(image)
+        except Exception as exc:
+            return JSONResponse(status_code=500, content={"error": f"ocr failed: {exc}"})
+
+    return {
+        "text": text,
+        "flat": flat,
+        "lines": n,
+        "tables": tables,
+        "boxes": boxes,
+        "took_ms": int((time.time() - started) * 1000),
+    }
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        app,
+        host=os.getenv("SURYA_HOST", "0.0.0.0"),
+        port=int(os.getenv("SURYA_PORT", "8422")),
+        workers=1,
+    )

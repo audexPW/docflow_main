@@ -1,0 +1,329 @@
+package recognize
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"docflow/internal/config"
+	"docflow/internal/domain"
+	"docflow/internal/filestore"
+)
+
+// Порог, ниже которого доверяем разбор типа модели, а не только правилам.
+const typeConfidenceThreshold = 0.5
+
+// Допустимое расхождение суммы строк табличной части с итогом документа
+// (доля от итога). Больше — считаем таблицу разобранной неверно.
+const LinesTolerance = 0.01
+
+type Pipeline struct {
+	cfg   config.Config
+	files *filestore.Store
+	model *modelClient
+	ocr   ocrEngine
+	log   *slog.Logger
+}
+
+func NewPipeline(cfg config.Config, files *filestore.Store, log *slog.Logger) *Pipeline {
+	ocr := newOCREngine(cfg.OCR)
+	log.Info("ocr engine selected", "engine", ocr.name())
+	return &Pipeline{
+		cfg:   cfg,
+		files: files,
+		model: newModelClient(cfg.LLM),
+		ocr:   ocr,
+		log:   log,
+	}
+}
+
+type Result struct {
+	Recognition domain.Recognition
+	OCRText     string
+}
+
+// Process выполняет полный разбор документа по его файлу в хранилище.
+func (p *Pipeline) Process(ctx context.Context, doc domain.Document) (Result, error) {
+	workDir, err := os.MkdirTemp("", "docflow-*")
+	if err != nil {
+		return Result{}, fmt.Errorf("temp dir: %w", err)
+	}
+	defer os.RemoveAll(workDir)
+
+	srcPath, err := p.files.ExtractTo(doc.StorageKey, workDir, "source"+ext(doc))
+	if err != nil {
+		return Result{}, fmt.Errorf("extract source: %w", err)
+	}
+
+	return p.processPath(ctx, srcPath, doc.ContentType, workDir)
+}
+
+// ProcessFile разбирает файл, лежащий на диске в открытом виде, минуя
+// зашифрованное хранилище. Нужен для замера точности на выборке заказчика
+// (cmd/accuracy) — там документы просто лежат в каталоге.
+func (p *Pipeline) ProcessFile(ctx context.Context, path string) (Result, error) {
+	workDir, err := os.MkdirTemp("", "docflow-acc-*")
+	if err != nil {
+		return Result{}, fmt.Errorf("temp dir: %w", err)
+	}
+	defer os.RemoveAll(workDir)
+
+	contentType := "application/octet-stream"
+	if strings.EqualFold(filepath.Ext(path), ".pdf") {
+		contentType = "application/pdf"
+	}
+	return p.processPath(ctx, path, contentType, workDir)
+}
+
+func (p *Pipeline) processPath(ctx context.Context, srcPath, contentType, workDir string) (Result, error) {
+	ocrCtx, cancel := context.WithTimeout(ctx, p.cfg.OCR.Timeout)
+	defer cancel()
+
+	pages, err := preparePages(ocrCtx, p.cfg.OCR, srcPath, contentType, workDir)
+	if err != nil {
+		return Result{}, fmt.Errorf("prepare pages: %w", err)
+	}
+
+	ocrText, err := runOCR(ocrCtx, p.ocr, pages)
+	if err != nil {
+		return Result{}, fmt.Errorf("ocr: %w", err)
+	}
+	ocrText = strings.TrimSpace(ocrText)
+	if ocrText == "" {
+		return Result{}, fmt.Errorf("no text recognized")
+	}
+
+	byRules := RecognizeText(ocrText)
+	typeConf := byRules.DocTypeConfidence
+
+	// Модель подключается, когда правилам не хватило: тип не опознан уверенно,
+	// либо опознан, но не собраны обязательные реквизиты, либо не разобрана
+	// табличная часть у документа, который её обязан иметь. ТЗ §5: система
+	// принимает любые документы, поэтому шаблонного разбора недостаточно.
+	// Модель локальная, наружу ничего не уходит.
+	if p.model.enabled() && needsModel(byRules, typeConf) {
+		if refined, ok := p.refineWithModel(ctx, ocrText, byRules); ok {
+			return Result{Recognition: refined, OCRText: ocrText}, nil
+		}
+	}
+
+	return Result{Recognition: byRules, OCRText: ocrText}, nil
+}
+
+// needsModel решает, звать ли модель после прохода правил.
+func needsModel(rec domain.Recognition, typeConf float64) bool {
+	if rec.DocType == DocTypeUnknown || rec.DocType == "" {
+		return true
+	}
+	if typeConf < typeConfidenceThreshold {
+		return true
+	}
+	if len(MissingRequired(rec)) > 0 {
+		return true
+	}
+	// Тип предполагает номенклатуру, а таблица не разобрана — правила бессильны,
+	// пусть попробует модель.
+	if len(rec.Lines) == 0 && typeHasLines(rec.DocType) {
+		return true
+	}
+	// Таблица разобрана, но не сходится с итогом — почти наверняка разъехались
+	// колонки; модель разбирает такое заметно лучше регулярок.
+	return LinesTotalMismatch(rec, LinesTolerance)
+}
+
+// RecognizeText — разбор документа одними правилами, без OCR и без модели.
+// Вынесено отдельно, чтобы результат правил можно было проверить на любом
+// тексте: это то, что получит 1С, если локальная модель выключена.
+func RecognizeText(ocrText string) domain.Recognition {
+	docType, conf := classifyByRules(ocrText)
+	return domain.Recognition{
+		DocType:           docType,
+		DocTypeConfidence: conf,
+		Fields:            extractByRules(ocrText),
+		Lines:             ExtractLines(ocrText),
+	}
+}
+
+type modelLine struct {
+	Name   string `json:"name"`
+	Qty    string `json:"qty"`
+	Unit   string `json:"unit"`
+	Price  string `json:"price"`
+	Amount string `json:"amount"`
+	VAT    string `json:"vat"`
+}
+
+type modelExtract struct {
+	DocType string            `json:"doc_type"`
+	Fields  map[string]string `json:"fields"`
+	Lines   []modelLine       `json:"lines"`
+}
+
+func (p *Pipeline) refineWithModel(ctx context.Context, ocrText string, byRules domain.Recognition) (domain.Recognition, bool) {
+	system := "Ты разбираешь распознанный текст бухгалтерского документа. " +
+		"Определи тип документа, извлеки реквизиты и строки табличной части. " +
+		"Ответь строго одним JSON-объектом без пояснений и без markdown."
+
+	user := buildExtractPrompt(ocrText, byRules.DocType)
+
+	raw, err := p.model.complete(ctx, system, user)
+	if err != nil {
+		p.log.Warn("model refine failed, falling back to rules", "error", err)
+		return domain.Recognition{}, false
+	}
+
+	var me modelExtract
+	if err := decodeJSONObject(raw, &me); err != nil {
+		p.log.Warn("model returned unparseable json", "error", err)
+		return domain.Recognition{}, false
+	}
+
+	fields := make(map[string]domain.Field, len(byRules.Fields)+len(me.Fields))
+	for k, v := range byRules.Fields {
+		fields[k] = v
+	}
+	for k, v := range me.Fields {
+		k = strings.TrimSpace(strings.ToLower(k))
+		if v = strings.TrimSpace(v); k == "" || v == "" {
+			continue
+		}
+		fields[k] = domain.Field{Value: v, Confidence: 0.85, Source: "model"}
+	}
+
+	// Модель отвечает свободным текстом («Товарная накладная», «Invoice»), а
+	// таблица обязательных полей и приёмник 1С работают по slug из реестра.
+	// Без нормализации документ получил бы тип, которого никто не знает.
+	docType := NormalizeDocType(me.DocType)
+	if docType == "" || docType == DocTypeUnknown {
+		docType = byRules.DocType
+	}
+
+	// Табличную часть от модели берём только если она непустая; иначе
+	// оставляем разобранную правилами.
+	lines := byRules.Lines
+	if converted := convertModelLines(me.Lines); len(converted) > 0 {
+		lines = converted
+	}
+
+	return domain.Recognition{
+		DocType:           docType,
+		DocTypeConfidence: 0.85,
+		Fields:            fields,
+		Lines:             lines,
+	}, true
+}
+
+func convertModelLines(in []modelLine) []domain.LineItem {
+	out := make([]domain.LineItem, 0, len(in))
+	for _, l := range in {
+		name := strings.TrimSpace(l.Name)
+		if name == "" {
+			continue
+		}
+		out = append(out, domain.LineItem{
+			Name:   name,
+			Qty:    normalizeNumber(strings.TrimSpace(l.Qty)),
+			Unit:   strings.TrimSpace(l.Unit),
+			Price:  normalizeNumber(strings.TrimSpace(l.Price)),
+			Amount: normalizeNumber(strings.TrimSpace(l.Amount)),
+			VAT:    normalizeNumber(strings.TrimSpace(l.VAT)),
+		})
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func buildExtractPrompt(ocrText, ruleType string) string {
+	const maxChars = 6000
+	if len(ocrText) > maxChars {
+		ocrText = ocrText[:maxChars]
+	}
+	hint := "не определён"
+	if ruleType != DocTypeUnknown && ruleType != "" {
+		hint = ruleType
+	}
+
+	// Ключ налогового идентификатора берём из локали (by → unp, ru → inn),
+	// иначе модель вернёт поле, которого система не ждёт, и документ навсегда
+	// останется в статусе «нужны данные».
+	fieldSchema := map[string]string{
+		"number":           "номер документа",
+		"date":             "дата в формате ДД.ММ.ГГГГ",
+		"total":            "итоговая сумма числом",
+		"vat_amount":       "сумма НДС по документу числом (не ставка)",
+		"currency":         "код валюты: BYN, RUB, USD, EUR",
+		"counterparty":     "наименование контрагента — того, кто выставил документ (поставщик, продавец, исполнитель)",
+		"organization":     "наименование получателя документа (покупатель, плательщик, заказчик)",
+		"organization_unp": "налоговый номер получателя документа",
+	}
+	switch PrimaryTaxKey() {
+	case "unp":
+		fieldSchema["unp"] = "УНП контрагента (Беларусь, ровно 9 цифр)"
+	default:
+		fieldSchema["inn"] = "ИНН контрагента (10 или 12 цифр)"
+		fieldSchema["kpp"] = "КПП контрагента (9 цифр)"
+	}
+
+	schema := map[string]any{
+		"doc_type": docTypePromptHint(),
+		"fields":   fieldSchema,
+		"lines": []map[string]string{{
+			"name":   "наименование товара или услуги",
+			"qty":    "количество числом",
+			"unit":   "единица измерения",
+			"price":  "цена за единицу числом",
+			"amount": "сумма по строке числом",
+			"vat":    "ставка или сумма НДС",
+		}},
+	}
+	schemaJSON, _ := json.Marshal(schema)
+
+	var b strings.Builder
+	b.WriteString("Предварительная гипотеза по типу: ")
+	b.WriteString(hint)
+	b.WriteString(".\nВерни JSON строго по схеме (лишние поля можно опустить, пустые не выдумывай).\n")
+	b.WriteString("Если табличной части в документе нет — верни \"lines\": [].\n")
+	b.WriteString("Суммы и количества — числами, разделитель дробной части — точка, без пробелов между разрядами.\n")
+	b.Write(schemaJSON)
+	b.WriteString("\n\nТекст документа:\n---\n")
+	b.WriteString(ocrText)
+	b.WriteString("\n---")
+	return b.String()
+}
+
+func ext(d domain.Document) string {
+	switch strings.ToLower(d.ContentType) {
+	case "application/pdf":
+		return ".pdf"
+	case "image/png":
+		return ".png"
+	case "image/jpeg":
+		return ".jpg"
+	case "image/heic", "image/heif":
+		return ".heic"
+	}
+	if i := strings.LastIndexByte(d.OriginalName, '.'); i >= 0 {
+		return d.OriginalName[i:]
+	}
+	return ".bin"
+}
+
+// docTypePromptHint перечисляет модели известные системе типы, чтобы она
+// отвечала кодом из реестра, а не произвольным названием. Хвост «или иной»
+// оставлен намеренно: перечень открыт (ТЗ §5), незнакомую форму модель должна
+// назвать своими словами, а не втискивать в ближайший знакомый код.
+func docTypePromptHint() string {
+	specs := DocTypes()
+	codes := make([]string, 0, len(specs))
+	for _, s := range specs {
+		codes = append(codes, s.Slug+" — "+s.Title)
+	}
+	return "строка: код типа документа из списка [" + strings.Join(codes, "; ") +
+		"]; если документ не подходит ни под один — назови тип своими словами"
+}

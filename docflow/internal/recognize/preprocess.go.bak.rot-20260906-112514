@@ -1,0 +1,132 @@
+package recognize
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
+	"strings"
+
+	"docflow/internal/config"
+)
+
+// preparePages приводит входной файл к списку изображений-страниц, готовых к OCR.
+// PDF растрируется через pdftoppm, затем КАЖДАЯ страница (и одиночное
+// изображение тоже) прогоняется через ImageMagick: выравнивание наклона,
+// подавление шума, растяжка контраста. На мятых фотографиях и сканах с
+// неравномерной подсветкой это даёт основной прирост качества OCR.
+func preparePages(ctx context.Context, cfg config.OCRConfig, srcPath, contentType, workDir string) ([]string, error) {
+	ext := strings.ToLower(filepath.Ext(srcPath))
+	isPDF := contentType == "application/pdf" || ext == ".pdf"
+
+	var pages []string
+	if isPDF {
+		p, err := rasterizePDF(ctx, cfg, srcPath, workDir)
+		if err != nil {
+			return nil, err
+		}
+		pages = p
+	} else {
+		pages = []string{srcPath}
+	}
+
+	out := make([]string, 0, len(pages))
+	for i, p := range pages {
+		out = append(out, enhancePage(ctx, cfg, p, workDir, i))
+	}
+	return out, nil
+}
+
+func rasterizePDF(ctx context.Context, cfg config.OCRConfig, srcPath, workDir string) ([]string, error) {
+	prefix := filepath.Join(workDir, "page")
+	cmd := exec.CommandContext(ctx, cfg.PdftoppmBin,
+		"-png",
+		"-r", fmt.Sprintf("%d", cfg.DPI),
+		"-gray",
+		srcPath, prefix,
+	)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("pdftoppm: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+
+	matches, err := filepath.Glob(prefix + "*.png")
+	if err != nil {
+		return nil, err
+	}
+	if len(matches) == 0 {
+		return nil, fmt.Errorf("pdftoppm produced no pages")
+	}
+	sort.Strings(matches)
+	return matches, nil
+}
+
+// enhancePage улучшает одну страницу через ImageMagick. Поведение настраивается
+// переменными окружения, чтобы подбирать параметры без пересборки образа:
+//
+//	OCR_ENHANCE   basic (по умолчанию) | photo | off
+//	OCR_DESKEW    порог выравнивания наклона, например 40% (off — выключить)
+//	OCR_LEVEL     растяжка уровней для режима basic, например 12%,92%
+//	OCR_LAT       адаптивная бинаризация для режима photo, например 25x25-10%
+//	OCR_SHARPEN   резкость, например 0x1 (off — выключить)
+//	OCR_UPSCALE   масштабирование, например 150% (пусто — не менять)
+//
+// Если ImageMagick недоступен или упал — возвращаем исходный файл, OCR
+// отработает и по нему.
+func enhancePage(ctx context.Context, cfg config.OCRConfig, srcPath, workDir string, idx int) string {
+	mode := strings.ToLower(envOr("OCR_ENHANCE", "basic"))
+	if mode == "off" || mode == "none" {
+		return srcPath
+	}
+
+	dst := filepath.Join(workDir, fmt.Sprintf("prep_%03d.png", idx))
+
+	args := []string{
+		srcPath,
+		"-auto-orient",
+		"-background", "white",
+		"-alpha", "remove",
+		"-colorspace", "Gray",
+	}
+
+	if v := envOr("OCR_DESKEW", "40%"); v != "off" {
+		args = append(args, "-deskew", v)
+	}
+
+	args = append(args, "-despeckle", "-normalize")
+
+	if mode == "photo" {
+		// Адаптивный порог по окрестности: вытягивает текст на фотографиях с
+		// бликами и неравномерной подсветкой, где глобальная бинаризация
+		// выжигает половину листа.
+		args = append(args, "-lat", envOr("OCR_LAT", "25x25-10%"))
+	} else {
+		args = append(args, "-level", envOr("OCR_LEVEL", "12%,92%"))
+	}
+
+	if v := envOr("OCR_SHARPEN", "0x1"); v != "off" {
+		args = append(args, "-sharpen", v)
+	}
+	if v := envOr("OCR_UPSCALE", ""); v != "" {
+		args = append(args, "-resize", v)
+	}
+
+	args = append(args, "-strip", dst)
+
+	cmd := exec.CommandContext(ctx, cfg.MagickBin, args...)
+	if err := cmd.Run(); err != nil {
+		return srcPath
+	}
+	if st, err := os.Stat(dst); err != nil || st.Size() == 0 {
+		return srcPath
+	}
+	return dst
+}
+
+func envOr(key, def string) string {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		return v
+	}
+	return def
+}

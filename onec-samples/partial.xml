@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Message format="EnterpriseData/1.0">
+  <Body>
+    <Document kind="partial" incomplete="true">
+      <SourceId>7a1c3e64-2b8d-4a1e-9c11-0f2a5b6d7e80</SourceId>
+      <Type>schet_faktura</Type>
+      <TypeTitle>Счёт-фактура (ЭСЧФ)</TypeTitle>
+      <Target object="Документ.ИмяИзВашейКонфигурации" kind="document"></Target>
+      <Number>ЭСЧФ-000451</Number>
+      <Date>05.07.2026</Date>
+      <Organization>ЧУП &#34;ПартнёрБухгалтер&#34;</Organization>
+      <FileName>scan.jpg</FileName>
+      <Counterparty>
+        <Name>ООО &#34;Ромашка&#34;</Name>
+      </Counterparty>
+      <Lines></Lines>
+      <MissingFields>
+        <Field>total</Field>
+        <Field>unp</Field>
+      </MissingFields>
+      <AdditionalFields></AdditionalFields>
+    </Document>
+  </Body>
+</Message>

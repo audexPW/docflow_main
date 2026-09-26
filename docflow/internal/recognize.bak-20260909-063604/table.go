@@ -1,0 +1,947 @@
+package recognize
+
+import (
+	"fmt"
+	"regexp"
+	"strings"
+
+	"docflow/internal/domain"
+)
+
+// Разбор табличной части как таблицы.
+//
+// На вход идёт текст с восстановленной раскладкой (layout.go или surya-ocr):
+// ячейки одной строки разделены « | ». Отсюда таблица собирается по-настоящему:
+// колонки берутся из шапки, ячейки раскладываются по колонкам, перенос
+// наименования на следующую строку приклеивается к предыдущей позиции, а строка
+// «Итого» отделяется от позиций.
+//
+// Прежний разбор (lines.go) работал по плоскому тексту и угадывал колонки по
+// хвостовым числам. Он остаётся запасным вариантом: если раскладки нет или
+// шапку в ней найти не удалось.
+
+var (
+	reCellSplit = regexp.MustCompile(`\s*\|\s*`)
+	// Разрыв в две и больше пробельных позиции — тоже граница ячейки:
+	// так выглядит таблица в тексте, где движок не проставил « | ».
+	reWideGap   = regexp.MustCompile(`\s{2,}`)
+	reTotalsRow = regexp.MustCompile(`(?i)^\s*(итого|всего|сумма к оплате|всего к оплате)`)
+	reNumberish = regexp.MustCompile(`\d`)
+)
+
+// ParseTable собирает таблицу из текста с раскладкой. Возвращает nil, если
+// таблицы в документе нет — это нормально (договор, чек, акт без расшифровки).
+func ParseTable(layoutText string) *domain.Table {
+	if strings.TrimSpace(layoutText) == "" {
+		return nil
+	}
+	rows := splitGrid(layoutText)
+	headerIdx, cols := findGridHeader(rows)
+	if headerIdx < 0 {
+		return nil
+	}
+
+	table := &domain.Table{Columns: cols, Source: "layout"}
+	rowNo := 0
+	for i := headerIdx + 1; i < len(rows); i++ {
+		cells := rows[i]
+		if len(cells) == 0 || strings.TrimSpace(strings.Join(cells, "")) == "" {
+			continue
+		}
+		joined := strings.TrimSpace(strings.Join(cells, " "))
+
+		if reTotalsRow.MatchString(joined) {
+			table.TotalsRow = assignCells(cells, cols)
+			break
+		}
+		if reTableStop.MatchString(joined) {
+			break
+		}
+
+		// Перенос наименования: строка без единой цифры и без разбиения на
+		// ячейки — это хвост предыдущей позиции, а не новая позиция.
+		if len(cells) == 1 && !reNumberish.MatchString(joined) && rowNo > 0 {
+			appendToName(&table.Rows[rowNo-1], joined)
+			continue
+		}
+		if !plausibleRow(cells) {
+			continue
+		}
+
+		rowNo++
+		table.Rows = append(table.Rows, domain.TableRow{
+			Index: rowNo,
+			Cells: assignCells(cells, cols),
+		})
+	}
+
+	if len(table.Rows) == 0 {
+		return nil
+	}
+	return table
+}
+
+// splitGrid режет текст на строки, а строки — на ячейки.
+func splitGrid(text string) [][]string {
+	var out [][]string
+	for _, line := range strings.Split(text, "\n") {
+		if strings.TrimSpace(line) == "" {
+			out = append(out, nil)
+			continue
+		}
+		var cells []string
+		if strings.Contains(line, "|") {
+			cells = reCellSplit.Split(strings.TrimSpace(line), -1)
+		} else {
+			cells = reWideGap.Split(strings.TrimSpace(line), -1)
+		}
+		clean := make([]string, 0, len(cells))
+		for _, c := range cells {
+			clean = append(clean, strings.TrimSpace(c))
+		}
+		out = append(out, clean)
+	}
+	return out
+}
+
+// findGridHeader ищет строку-шапку: в ней хотя бы две разные опознанные
+// колонки и есть наименование или сумма.
+func findGridHeader(rows [][]string) (int, []domain.TableColumn) {
+	for i, cells := range rows {
+		if len(cells) < 2 {
+			continue
+		}
+		cols := make([]domain.TableColumn, 0, len(cells))
+		kinds := map[colKind]bool{}
+		for j, cell := range cells {
+			kind := classifyHeaderCell(cell)
+			if kind != colUnknown && kind != colSkip {
+				kinds[kind] = true
+			}
+			cols = append(cols, domain.TableColumn{
+				Index: j + 1,
+				Title: cell,
+				Role:  roleName(kind),
+			})
+		}
+		if len(kinds) < 2 {
+			continue
+		}
+		if kinds[colName] || kinds[colAmount] {
+			return i, cols
+		}
+	}
+	return -1, nil
+}
+
+// classifyHeaderCell определяет назначение колонки по подписи ячейки целиком
+// («Кол-во», «Цена, руб.», «Наименование товаров (работ, услуг)»).
+func classifyHeaderCell(cell string) colKind {
+	for _, w := range strings.Fields(strings.ToLower(cell)) {
+		if k := classifyHeaderWord(w); k != colUnknown {
+			return k
+		}
+	}
+	return colUnknown
+}
+
+func roleName(k colKind) string {
+	switch k {
+	case colName:
+		return "name"
+	case colQty:
+		return "qty"
+	case colUnit:
+		return "unit"
+	case colPrice:
+		return "price"
+	case colAmount:
+		return "amount"
+	case colVAT:
+		return "vat"
+	case colSkip:
+		return "index"
+	}
+	return "other"
+}
+
+// assignCells раскладывает ячейки строки по колонкам. Совпало число ячеек —
+// раскладка прямая. Не совпало (движок склеил или разорвал ячейку) — числа
+// прижимаются к числовым колонкам справа, текст уходит в наименование: так
+// сумма не встаёт в колонку количества.
+func assignCells(cells []string, cols []domain.TableColumn) []domain.TableCell {
+	out := make([]domain.TableCell, 0, len(cols))
+	if len(cells) == len(cols) {
+		for i, c := range cells {
+			out = append(out, domain.TableCell{Column: cols[i].Index, Role: cols[i].Role, Value: c})
+		}
+		return out
+	}
+
+	var textCells, numCells []string
+	for _, c := range cells {
+		if c == "" {
+			continue
+		}
+		if reNumeric.MatchString(strings.ReplaceAll(c, " ", "")) {
+			numCells = append(numCells, c)
+		} else if isUnit(c) {
+			numCells = append(numCells, c)
+		} else {
+			textCells = append(textCells, c)
+		}
+	}
+
+	// Числовые колонки в порядке следования; заполняем их с конца — правая
+	// колонка (сумма) в документе почти всегда на месте, а слева бывают
+	// пропуски.
+	var numCols []domain.TableColumn
+	for _, c := range cols {
+		switch c.Role {
+		case "qty", "unit", "price", "amount", "vat":
+			numCols = append(numCols, c)
+		}
+	}
+	assigned := map[int]string{}
+	for i := 0; i < len(numCells) && i < len(numCols); i++ {
+		col := numCols[len(numCols)-1-i]
+		assigned[col.Index] = numCells[len(numCells)-1-i]
+	}
+
+	name := strings.TrimSpace(strings.Join(textCells, " "))
+	for _, c := range cols {
+		v := assigned[c.Index]
+		if c.Role == "name" {
+			v = name
+		}
+		out = append(out, domain.TableCell{Column: c.Index, Role: c.Role, Value: v})
+	}
+	return out
+}
+
+func appendToName(row *domain.TableRow, tail string) {
+	for i, c := range row.Cells {
+		if c.Role == "name" {
+			row.Cells[i].Value = strings.TrimSpace(c.Value + " " + tail)
+			return
+		}
+	}
+}
+
+// plausibleRow отсеивает строки, которые попали в таблицу случайно: подписи,
+// реквизиты банка, продолжение шапки. Позиция обязана иметь и текст, и число.
+func plausibleRow(cells []string) bool {
+	joined := strings.Join(cells, " ")
+	if !hasLetters(joined) || !reNumberish.MatchString(joined) {
+		return false
+	}
+	if len([]rune(strings.TrimSpace(joined))) < 4 {
+		return false
+	}
+	return true
+}
+
+// TableToLines переводит таблицу в прежний плоский вид строк: 1С-приёмник и
+// сверка сумм продолжают работать с LineItem, пока Дмитрий не перейдёт на
+// структуру Table целиком.
+func TableToLines(t *domain.Table) []domain.LineItem {
+	if t == nil {
+		return nil
+	}
+	out := make([]domain.LineItem, 0, len(t.Rows))
+	for _, row := range t.Rows {
+		var item domain.LineItem
+		var amounts []amountCell
+		for _, c := range row.Cells {
+			v := strings.TrimSpace(c.Value)
+			if v == "" {
+				continue
+			}
+			switch c.Role {
+			case "name":
+				item.Name = v
+			case "qty":
+				item.Qty = normalizeNumber(v)
+			case "unit":
+				item.Unit = v
+			case "price":
+				item.Price = normalizeNumber(v)
+			case "amount":
+				amounts = append(amounts, amountCell{
+					title: tableColumnTitle(t.Columns, c.Column),
+					value: normalizeNumber(v),
+				})
+			case "vat":
+				item.VAT = normalizeNumber(v)
+			}
+		}
+		applyAmounts(&item, amounts)
+		if item.Name == "" {
+			continue
+		}
+		out = append(out, item)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// LinesToTable собирает структуру таблицы из плоских строк — для случая, когда
+// таблицу разобрали правила или модель. Так выгрузка в 1С всегда содержит
+// таблицу в одном и том же виде, независимо от того, чем она получена.
+func LinesToTable(lines []domain.LineItem, source string) *domain.Table {
+	if len(lines) == 0 {
+		return nil
+	}
+	cols := []domain.TableColumn{
+		{Index: 1, Title: "Наименование", Role: "name"},
+		{Index: 2, Title: "Количество", Role: "qty"},
+		{Index: 3, Title: "Ед. изм.", Role: "unit"},
+		{Index: 4, Title: "Цена", Role: "price"},
+		{Index: 5, Title: "Сумма", Role: "amount"},
+		{Index: 6, Title: "НДС", Role: "vat"},
+	}
+	t := &domain.Table{Columns: cols, Source: source}
+	for i, l := range lines {
+		t.Rows = append(t.Rows, domain.TableRow{
+			Index: i + 1,
+			Cells: []domain.TableCell{
+				{Column: 1, Role: "name", Value: l.Name},
+				{Column: 2, Role: "qty", Value: l.Qty},
+				{Column: 3, Role: "unit", Value: l.Unit},
+				{Column: 4, Role: "price", Value: l.Price},
+				{Column: 5, Role: "amount", Value: l.Amount},
+				{Column: 6, Role: "vat", Value: l.VAT},
+			},
+		})
+	}
+	return t
+}
+
+// TableAsGrid отдаёт таблицу текстом с разделителями — в таком виде её удобно
+// показать модели: она видит колонки, а не склеенную строку.
+func TableAsGrid(t *domain.Table) string {
+	if t == nil {
+		return ""
+	}
+	var b strings.Builder
+	titles := make([]string, 0, len(t.Columns))
+	for _, c := range t.Columns {
+		title := c.Title
+		if title == "" {
+			title = c.Role
+		}
+		titles = append(titles, title)
+	}
+	b.WriteString(strings.Join(titles, " | "))
+	b.WriteByte('\n')
+	for _, row := range t.Rows {
+		vals := make([]string, 0, len(row.Cells))
+		for _, c := range row.Cells {
+			vals = append(vals, c.Value)
+		}
+		b.WriteString(strings.Join(vals, " | "))
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
+// ---------------------------------------------------------------------------
+// Свободная табличная часть.
+//
+// Раньше любая таблица приводилась к шести колонкам (LinesToTable), и всё, что
+// в них не влезало, теряло место: в счёте-протоколе восемь граф — «цена без
+// НДС», «стоимость без НДС», «ставка НДС», «сумма НДС», «сумма с НДС», — и при
+// укладке в шесть сумма с НДС оказывалась в колонке «цена». Ниже — работа с
+// таблицей как она есть: сколько колонок в документе, столько и в результате.
+// ---------------------------------------------------------------------------
+
+// guessRole определяет роль колонки по её заголовку. Используется только для
+// выгрузки в 1С; на отображение и на состав колонок не влияет. Порядок проверок
+// важен: «сумма НДС» — это vat, а не amount, «ставка НДС» — vat_rate.
+func guessRole(title string) string {
+	t := strings.ToLower(strings.Join(strings.Fields(title), " "))
+	if t == "" {
+		return ""
+	}
+	// Порядок проверок здесь — не стилистика, а суть. В счёте-протоколе шесть
+	// заголовков из восьми содержат «НДС»: «Цена без НДС», «Стоимость без НДС»,
+	// «Ставка НДС», «Сумма НДС», «Сумма с НДС». Если проверять «ндс» первым, в
+	// разряд налога уедут и цена, и стоимость. Поэтому сперва разбираем, что за
+	// величина в графе (цена/стоимость/количество), и только потом — как она
+	// относится к налогу.
+	hasVAT := strings.Contains(t, "ндс")
+	withVAT := strings.Contains(t, "с ндс") || strings.Contains(t, "включая")
+	withoutVAT := strings.Contains(t, "без ндс")
+
+	switch {
+	case strings.Contains(t, "кол-во"), strings.Contains(t, "количество"):
+		return "qty"
+	case strings.Contains(t, "ед."), strings.Contains(t, "ед изм"), strings.Contains(t, "единиц"):
+		return "unit"
+	case strings.Contains(t, "ставка"), strings.Contains(t, "%"):
+		return "vat_rate"
+	case strings.Contains(t, "цена"), strings.Contains(t, "тариф"):
+		return "price"
+	case strings.Contains(t, "стоимость"), strings.Contains(t, "сумма"),
+		strings.Contains(t, "всего"), strings.Contains(t, "итого"):
+		// «Сумма НДС» — это налог. «Сумма с НДС» и «Стоимость без НДС» — деньги
+		// по строке; из нескольких таких колонок в 1С уйдёт последняя, то есть
+		// сумма с налогом.
+		if hasVAT && !withVAT && !withoutVAT {
+			return "vat"
+		}
+		return "amount"
+	case strings.Contains(t, "наимен"), strings.Contains(t, "предмет"),
+		strings.Contains(t, "товар"), strings.Contains(t, "услуг"),
+		strings.Contains(t, "работ"), strings.Contains(t, "описан"):
+		return "name"
+	case t == "№", t == "n", strings.Contains(t, "п/п"), strings.Contains(t, "номер"):
+		return "index"
+	case hasVAT:
+		// Ставку («Ставка НДС», «НДС %») отловили выше, поэтому голый
+		// заголовок «НДС» — это сумма налога по строке. Иначе в 1С
+		// вместо 1,37 уходило бы 20.
+		return "vat"
+	}
+	return "other"
+}
+
+// rolesFor раскладывает роли по колонкам. Первую текстовую колонку без роли
+// считаем наименованием — в любой бухгалтерской таблице она там и стоит.
+func rolesFor(cols []string) []string {
+	roles := make([]string, len(cols))
+	hasName := false
+	for i, c := range cols {
+		roles[i] = guessRole(c)
+		if roles[i] == "name" {
+			hasName = true
+		}
+	}
+	if !hasName {
+		for i := range roles {
+			if roles[i] == "" || roles[i] == "other" {
+				roles[i] = "name"
+				break
+			}
+		}
+	}
+	return roles
+}
+
+// FreeTableFromGrid собирает свободную таблицу прямо из текста с раскладкой:
+// шапка — первая строка, где не меньше трёх непустых ячеек, остальные строки —
+// позиции. Колонки не переименовываются и не отбрасываются.
+func FreeTableFromGrid(layoutText string) *domain.FreeTable {
+	if strings.TrimSpace(layoutText) == "" {
+		return nil
+	}
+	rows := splitGrid(layoutText)
+	head := -1
+	for i, cells := range rows {
+		nonEmpty := 0
+		for _, c := range cells {
+			if strings.TrimSpace(c) != "" {
+				nonEmpty++
+			}
+		}
+		if nonEmpty < 3 {
+			continue
+		}
+		// Шапка — строка без денежных значений, но с узнаваемыми подписями.
+		known := 0
+		for _, c := range cells {
+			if r := guessRole(c); r != "" && r != "other" {
+				known++
+			}
+		}
+		if known >= 2 {
+			head = i
+			break
+		}
+	}
+	if head < 0 {
+		return nil
+	}
+
+	cols := make([]string, 0, len(rows[head]))
+	for _, c := range rows[head] {
+		cols = append(cols, strings.TrimSpace(c))
+	}
+	ft := &domain.FreeTable{Columns: cols, Roles: rolesFor(cols), Source: "layout"}
+
+	for i := head + 1; i < len(rows); i++ {
+		cells := rows[i]
+		joined := strings.TrimSpace(strings.Join(cells, " "))
+		if joined == "" {
+			continue
+		}
+		if reTableStop.MatchString(joined) {
+			break
+		}
+		norm := padRow(cells, len(cols))
+		if reTotalsRow.MatchString(joined) {
+			ft.Totals = norm
+			break
+		}
+		if !plausibleRow(cells) {
+			continue
+		}
+		ft.Rows = append(ft.Rows, norm)
+	}
+	if len(ft.Rows) == 0 {
+		return nil
+	}
+	return ft
+}
+
+// padRow приводит строку к ширине шапки: не хватает ячеек — дополняем пустыми,
+// лишние — склеиваем в последнюю, чтобы ничего не потерялось молча.
+func padRow(cells []string, width int) []string {
+	out := make([]string, width)
+	for i := 0; i < width && i < len(cells); i++ {
+		out[i] = strings.TrimSpace(cells[i])
+	}
+	if len(cells) > width && width > 0 {
+		tail := make([]string, 0, len(cells)-width+1)
+		tail = append(tail, out[width-1])
+		for _, c := range cells[width:] {
+			if s := strings.TrimSpace(c); s != "" {
+				tail = append(tail, s)
+			}
+		}
+		out[width-1] = strings.TrimSpace(strings.Join(tail, " "))
+	}
+	return out
+}
+
+// FreeTableToLines сводит свободную таблицу к плоским LineItem по ролям —
+// только для выгрузки в 1С и сверки сумм. Отображение и raw-структура при этом
+// остаются полными.
+func FreeTableToLines(ft *domain.FreeTable) []domain.LineItem {
+	if ft == nil || len(ft.Rows) == 0 {
+		return nil
+	}
+	roles := ft.Roles
+	if len(roles) != len(ft.Columns) {
+		roles = rolesFor(ft.Columns)
+	}
+	out := make([]domain.LineItem, 0, len(ft.Rows))
+	for _, row := range ft.Rows {
+		var item domain.LineItem
+		var extraName []string
+		var amounts []amountCell
+		vatIsAmount := false
+		for i, v := range row {
+			v = strings.TrimSpace(v)
+			if v == "" || i >= len(roles) {
+				continue
+			}
+			switch roles[i] {
+			case "name":
+				if item.Name == "" {
+					item.Name = v
+				} else {
+					extraName = append(extraName, v)
+				}
+			case "qty":
+				item.Qty = normalizeNumber(v)
+			case "unit":
+				item.Unit = v
+			case "price":
+				if item.Price == "" {
+					item.Price = normalizeNumber(v)
+				}
+			case "amount":
+				// Денежные графы копим все до единой. Раньше здесь оставалась
+				// только последняя, и «Сумма» без НДС не доезжала до файла.
+				amounts = append(amounts, amountCell{
+					title: columnTitle(ft.Columns, i),
+					value: normalizeNumber(v),
+				})
+			case "vat":
+				// Сумма налога всегда важнее ставки: в 1С уходит именно она.
+				// Если ставку уже записали раньше по порядку граф — перебиваем.
+				item.VAT = normalizeNumber(v)
+				vatIsAmount = true
+			case "vat_rate":
+				// Ставку («20», «20%») берём запасным вариантом — когда графы с
+				// суммой налога в документе нет. Иначе в накладной, где «% НДС»
+				// стоит левее «Суммы НДС», в 1С вместо 1,37 уезжало 20.
+				if item.VAT == "" && !vatIsAmount {
+					item.VAT = normalizeNumber(v)
+				}
+			}
+		}
+		// НДС по строке уже разобран, поэтому денежные графы раскладываем
+		// после цикла: итог отличаем от суммы без налога по арифметике.
+		applyAmounts(&item, amounts)
+		if item.Name == "" {
+			continue
+		}
+		if len(extraName) > 0 {
+			item.Name = strings.TrimSpace(item.Name + " " + strings.Join(extraName, " "))
+		}
+		out = append(out, item)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// FreeTableToTable оборачивает свободную таблицу в domain.Table, сохраняя
+// оригинальные колонки. Так интерфейс и приёмник 1С получают ровно те графы,
+// что напечатаны в документе, а прежний контракт (columns/rows/cells) не
+// ломается.
+func FreeTableToTable(ft *domain.FreeTable) *domain.Table {
+	if ft == nil || len(ft.Rows) == 0 {
+		return nil
+	}
+	roles := ft.Roles
+	if len(roles) != len(ft.Columns) {
+		roles = rolesFor(ft.Columns)
+	}
+	cols := make([]domain.TableColumn, 0, len(ft.Columns))
+	for i, title := range ft.Columns {
+		cols = append(cols, domain.TableColumn{Index: i + 1, Title: title, Role: roles[i]})
+	}
+	t := &domain.Table{Columns: cols, Source: ft.Source, RawCells: ft}
+	for i, row := range ft.Rows {
+		cells := make([]domain.TableCell, 0, len(cols))
+		for j := range cols {
+			v := ""
+			if j < len(row) {
+				v = row[j]
+			}
+			cells = append(cells, domain.TableCell{Column: j + 1, Role: roles[j], Value: v})
+		}
+		t.Rows = append(t.Rows, domain.TableRow{Index: i + 1, Cells: cells})
+	}
+	if len(ft.Totals) > 0 {
+		tot := make([]domain.TableCell, 0, len(cols))
+		for j := range cols {
+			v := ""
+			if j < len(ft.Totals) {
+				v = ft.Totals[j]
+			}
+			tot = append(tot, domain.TableCell{Column: j + 1, Role: roles[j], Value: v})
+		}
+		t.TotalsRow = tot
+	}
+	return t
+}
+
+// FreeTableAsGrid показывает свободную таблицу модели построчно, с номерами
+// колонок: так модель понимает, сколько граф в документе, и не сворачивает их.
+func FreeTableAsGrid(ft *domain.FreeTable) string {
+	if ft == nil {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(strings.Join(ft.Columns, " | "))
+	b.WriteByte('\n')
+	for _, r := range ft.Rows {
+		b.WriteString(strings.Join(r, " | "))
+		b.WriteByte('\n')
+	}
+	if len(ft.Totals) > 0 {
+		b.WriteString(strings.Join(ft.Totals, " | "))
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
+// ---------------------------------------------------------------------------
+// Таблица из детектора (surya table_rec).
+//
+// Здесь не надо угадывать границы колонок: row_id и col_id пришли от модели
+// разметки. Остаётся разложить ячейки по сетке и понять, какая строка — шапка.
+// ---------------------------------------------------------------------------
+
+// FreeTableFromGrid2 собирает свободную таблицу из сетки детектора. Берётся
+// таблица с наибольшим числом заполненных ячеек: на странице кроме товарной
+// части бывают рамки реквизитов, которые детектор тоже считает таблицами.
+func FreeTableFromGrid2(grids []GridTable) *domain.FreeTable {
+	best := pickGrid(grids)
+	if best == nil {
+		gridDiag = "pickGrid: подходящей таблицы нет (мало колонок или пустые ячейки)"
+		return nil
+	}
+
+	maxRow, maxCol := 0, 0
+	for _, c := range best.Cells {
+		if r := c.Row + span(c.RowSpan) - 1; r > maxRow {
+			maxRow = r
+		}
+		if col := c.Col + span(c.ColSpan) - 1; col > maxCol {
+			maxCol = col
+		}
+	}
+	if maxCol < 1 || maxRow < 1 {
+		gridDiag = "сетка вырожденная: меньше двух строк или колонок"
+		return nil
+	}
+
+	grid := make([][]string, maxRow+1)
+	for i := range grid {
+		grid[i] = make([]string, maxCol+1)
+	}
+	headerRow := -1
+	headerFlagged := make(map[int]bool)
+	for _, c := range best.Cells {
+		if c.Row < 0 || c.Col < 0 || c.Row > maxRow || c.Col > maxCol {
+			continue
+		}
+		v := StripMath(strings.TrimSpace(c.Text))
+		// Объединённая ячейка занимает несколько граф. Раньше её значение
+		// вставало только в левую, и вся строка уезжала влево. Теперь
+		// объединение учитывается при расчёте ширины сетки, а повтор одного и
+		// того же текста в ячейке не дублируется.
+		if grid[c.Row][c.Col] == "" {
+			grid[c.Row][c.Col] = v
+		} else if v != "" && grid[c.Row][c.Col] != v {
+			grid[c.Row][c.Col] = strings.TrimSpace(grid[c.Row][c.Col] + " " + v)
+		}
+		if c.Header {
+			headerFlagged[c.Row] = true
+		}
+	}
+
+	// Флагу header верим не вслепую. Детектор помечает шапкой и блок над
+	// таблицей — реквизиты покупателя, р/с, банк: длинный текст, который
+	// целиком лежит в одной графе, а остальные семь пустые. Взяв такую
+	// строку за шапку, мы уводим настоящие подписи граф в данные, и графы
+	// приезжают в 1С без названий. Шапка — это несколько коротких подписей,
+	// поэтому строку с одной заполненной ячейкой пропускаем и смотрим ниже.
+	for r := 0; r <= maxRow; r++ {
+		if !headerFlagged[r] {
+			continue
+		}
+		filled := 0
+		for _, v := range grid[r] {
+			if strings.TrimSpace(v) != "" {
+				filled++
+			}
+		}
+		if filled >= 2 {
+			headerRow = r
+			break
+		}
+	}
+
+	// Детектор не всегда помечает шапку. Тогда ищем её сами: первая строка,
+	// где хотя бы две ячейки опознаются как названия граф.
+	if headerRow < 0 {
+		for i, row := range grid {
+			known := 0
+			seen := map[string]bool{}
+			for _, v := range row {
+				if r := guessRole(v); r != "" && r != "other" && !seen[r] {
+					seen[r] = true
+					known++
+				}
+			}
+			if known >= 2 {
+				headerRow = i
+				break
+			}
+		}
+	}
+	if headerRow < 0 {
+		gridDiag = "шапка не опознана: ни одна строка не дала двух известных колонок"
+		return nil
+	}
+
+	// Шапка бывает в два-три ряда: «Сумма» сверху, «без НДС, руб.» снизу.
+	// Склеиваем их, пока ряд не содержит чисел, иначе подпись графы теряется,
+	// а сам ряд попадает в таблицу отдельной пустой позицией.
+	lastHead := headerRow
+	for lastHead+1 <= maxRow && gridRowIsHeaderTail(grid[lastHead+1]) {
+		lastHead++
+	}
+	cols := make([]string, maxCol+1)
+	for i := headerRow; i <= lastHead; i++ {
+		if isNumberingRow(grid[i]) {
+			continue
+		}
+		for j, v := range grid[i] {
+			if v == "" {
+				continue
+			}
+			if cols[j] == "" {
+				cols[j] = v
+			} else {
+				cols[j] = strings.TrimSpace(cols[j] + " " + v)
+			}
+		}
+	}
+
+	ft := &domain.FreeTable{Columns: cols, Roles: rolesFor(cols), Source: "grid"}
+	for i := lastHead + 1; i <= maxRow; i++ {
+		row := grid[i]
+		joined := strings.TrimSpace(strings.Join(row, " "))
+		if joined == "" || isNumberingRow(row) {
+			continue
+		}
+		if gridRowIsRepeat(row) {
+			// Все непустые ячейки несут один и тот же текст: детектор
+			// растиражировал подпись под таблицей по всему ряду. Не позиция.
+			continue
+		}
+		if reTotalsRow.MatchString(joined) {
+			if len(ft.Totals) == 0 {
+				ft.Totals = append([]string(nil), row...)
+			}
+			continue
+		}
+		if !hasLetters(joined) && !reNumberish.MatchString(joined) {
+			continue
+		}
+		// Перенос наименования в сетке. table_rec считает перенос строки
+		// внутри ячейки отдельной строкой таблицы, и позиция «Возмещение
+		// затрат по дезинфекции (места общего пользования)» приезжала двумя
+		// строками: во второй заполнена только графа наименования, чисел нет.
+		// Для проекции такая склейка есть (isNameContinuation), для сетки
+		// её не было — отсюда и рваные наименования в карточке.
+		if len(ft.Rows) > 0 && isNameContinuation(row, ft.Roles) {
+			appendToFreeName(ft.Rows[len(ft.Rows)-1], row, ft.Roles)
+			continue
+		}
+		ft.Rows = append(ft.Rows, append([]string(nil), row...))
+	}
+	ft.Rows = dropDegenerateRows(ft.Rows)
+	if len(ft.Rows) == 0 {
+		gridDiag = "шапка найдена, но ниже неё нет строк с данными"
+		return nil
+	}
+
+	// Сетка из пустых клеток. Детектор размечает как таблицу и рамку бланка,
+	// и поле для печати, и блок подписей: строки с колонками там есть, а
+	// текста в них нет. Раньше такая таблица проходила все проверки и уходила
+	// в 1С пустой табличной частью — документ выглядел распознанным, а
+	// позиций в нём не было ни одной.
+	filled, numeric := 0, 0
+	for _, r := range ft.Rows {
+		for _, v := range r {
+			if strings.TrimSpace(v) == "" {
+				continue
+			}
+			filled++
+			if reNumberish.MatchString(v) {
+				numeric++
+			}
+		}
+	}
+	total := len(ft.Rows) * len(cols)
+	if total > 0 && float64(filled)*100 < float64(total)*15 {
+		gridDiag = fmt.Sprintf("сетка почти пустая: заполнено %d клеток из %d", filled, total)
+		return nil
+	}
+	// В товарной таблице всегда есть числа — количество, цена или сумма.
+	// Их полное отсутствие означает, что размечен блок текста, а не таблица.
+	if numeric == 0 {
+		gridDiag = "в строках сетки нет ни одного числа — это не товарная таблица"
+		return nil
+	}
+
+	gridDiag = ""
+	return ft
+}
+
+// span приводит rowspan/colspan к разумному значению: старая версия сервиса
+// поля не отдаёт вовсе, и там приходит 0.
+func span(v int) int {
+	if v < 1 {
+		return 1
+	}
+	return v
+}
+
+// gridRowIsHeaderTail — продолжение шапки: подписи без единой цифры.
+func gridRowIsHeaderTail(row []string) bool {
+	nonEmpty := 0
+	for _, v := range row {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			continue
+		}
+		nonEmpty++
+		if reNumberish.MatchString(v) {
+			return false
+		}
+		if len([]rune(v)) > 40 {
+			return false
+		}
+	}
+	return nonEmpty > 0
+}
+
+// gridRowIsRepeat — в ряду все непустые ячейки одинаковые. Так выглядит текст
+// из-под таблицы, растащенный детектором по всем графам ряда.
+func gridRowIsRepeat(row []string) bool {
+	first, n := "", 0
+	for _, v := range row {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			continue
+		}
+		n++
+		if first == "" {
+			first = v
+			continue
+		}
+		if v != first {
+			return false
+		}
+	}
+	return n >= 2
+}
+
+// gridDiag — причина, по которой сетка не превратилась в таблицу. Только для
+// логов: помогает отличить «детектор не нашёл» от «мы сами отбросили».
+var gridDiag string
+
+// GridDiag отдаёт последнюю причину отказа.
+func GridDiag() string { return gridDiag }
+
+// pickGrid выбирает товарную таблицу из всех найденных на странице: у неё
+// больше всего непустых ячеек и не меньше трёх колонок. Рамка с реквизитами
+// поставщика формально тоже таблица, но позиций в ней нет.
+func pickGrid(grids []GridTable) *GridTable {
+	var best *GridTable
+	bestScore := -1
+	for i := range grids {
+		g := &grids[i]
+		filled, maxCol, numeric := 0, 0, 0
+		seen := map[string]bool{}
+		for _, c := range g.Cells {
+			t := strings.TrimSpace(c.Text)
+			if t != "" {
+				filled++
+			}
+			if reNumberish.MatchString(t) {
+				numeric++
+			}
+			if r := guessRole(StripMath(t)); r != "" && r != "other" {
+				seen[r] = true
+			}
+			if c.Col > maxCol {
+				maxCol = c.Col
+			}
+		}
+		if maxCol < 2 || filled < 4 {
+			continue
+		}
+		// Счёт по признакам товарной таблицы, а не по объёму текста. Рамка с
+		// реквизитами и блок подписей формально тоже таблицы, и по числу
+		// заполненных ячеек они нередко выигрывали у настоящей — отсюда и
+		// «таблица» из восьми одинаковых строк с текстом из-под документа.
+		score := len(seen)*100 + numeric*5 + filled
+		if score > bestScore {
+			best, bestScore = g, score
+		}
+	}
+	return best
+}

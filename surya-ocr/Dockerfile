@@ -1,0 +1,42 @@
+FROM python:3.11-slim
+
+# Системные библиотеки для opencv-headless / pillow (растровые форматы).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgl1 libglib2.0-0 curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# torch ставим CPU-сборкой отдельным индексом, чтобы не тянуть CUDA-колёса (~ГБ nvidia-либ).
+# surya-ocr==0.17.1 требует torch>=2.7,<3.
+RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu \
+        "torch==2.7.1"
+
+COPY requirements.txt .
+
+RUN pip install --no-cache-dir requests
+RUN pip install --no-cache-dir -i https://pypi.org/simple -r requirements.txt
+COPY server.py .
+
+# Кэш моделей HuggingFace держим внутри образа (полностью офлайн после сборки).
+ENV HF_HOME=/app/.cache/huggingface \
+    TORCH_DEVICE=cpu \
+    SURYA_HOST=0.0.0.0 \
+    SURYA_PORT=8422
+
+# Прогрев: скачать веса моделей в образ, чтобы контейнер работал без интернета.
+# На офлайн-машине сборки отключить: --build-arg WARMUP=0 (веса скачаются при первом запросе).
+ARG WARMUP=1
+RUN if [ "$WARMUP" = "1" ]; then \
+        python -c "from surya.foundation import FoundationPredictor; \
+from surya.recognition import RecognitionPredictor; \
+from surya.detection import DetectionPredictor; \
+f=FoundationPredictor(); RecognitionPredictor(f); DetectionPredictor(); \
+print('surya models warmed up')" ; \
+    fi
+
+EXPOSE 8422
+HEALTHCHECK --interval=15s --timeout=5s --start-period=120s --retries=10 \
+    CMD curl -fsS http://127.0.0.1:8422/health | grep -q '"ready": true' || exit 1
+
+CMD ["python", "server.py"]

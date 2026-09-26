@@ -1,0 +1,44 @@
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    volumes:
+      - docflow_files:/var/lib/docflow
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: docflow
+      POSTGRES_PASSWORD: docflow
+      POSTGRES_DB: docflow
+    volumes:
+      - docflow_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U docflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Локальная LLM. Модель кладётся в ./models и указывается в command.
+  # Раскомментировать при ONEC hybrid-режиме / LLM_ENABLED=true.
+  # llm:
+  #   image: ghcr.io/ggerganov/llama.cpp:server
+  #   restart: unless-stopped
+  #   command: >
+  #     -m /models/qwen2.5-7b-instruct-q4_k_m.gguf
+  #     --host 0.0.0.0 --port 8081 -c 4096 -t 4
+  #   volumes:
+  #     - ./models:/models
+  #   expose:
+  #     - "8081"
+
+volumes:
+  docflow_pg:
+  docflow_files:

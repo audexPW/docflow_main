@@ -1,0 +1,217 @@
+package recognize
+
+import (
+	"context"
+	"math"
+	"os/exec"
+	"sort"
+	"strconv"
+	"strings"
+
+	"docflow/internal/config"
+)
+
+// Восстановление раскладки страницы по координатам слов.
+//
+// Плоский текст OCR («строка за строкой») теряет главное, что есть в
+// бухгалтерском документе, — таблицу: колонки склеиваются в одну строку, и
+// дальше их приходится угадывать регулярками. Здесь слова группируются в
+// строки по вертикали, а внутри строки — в ячейки по горизонтальным разрывам.
+// Границы ячеек помечаются « | », и таблица дальше разбирается как таблица
+// (table.go), а не как текст.
+//
+// Тот же формат отдаёт surya-ocr в поле text, поэтому разбор общий для обоих
+// движков.
+
+// pageText — результат распознавания одной страницы в двух видах.
+// Layout — с восстановленными ячейками, Flat — построчно, как раньше
+// (регулярки в extract.go рассчитаны именно на него).
+// GridCell — ячейка таблицы из детектора: номер строки и колонки известны
+// точно, а не выведены из расстояний между словами.
+type GridCell struct {
+	Row     int    `json:"row"`
+	Col     int    `json:"col"`
+	RowSpan int    `json:"rowspan"`
+	ColSpan int    `json:"colspan"`
+	Header  bool   `json:"header"`
+	Text    string `json:"text"`
+}
+
+// GridTable — одна таблица страницы.
+type GridTable struct {
+	Cells []GridCell `json:"cells"`
+}
+
+type pageText struct {
+	Layout string
+	Flat   string
+	// Grids — таблицы, найденные детектором. Пусто — детектор выключен или
+	// таблиц на странице нет; тогда работает разбор по раскладке.
+	Grids []GridTable
+	// Words — слова страницы с координатами, как их отдал движок. По ним
+	// таблица собирается проекцией колонок (columns.go): это единственный
+	// способ получить графы документа, когда шапка перенесена на две строки и
+	// разбор по подписям не срабатывает.
+	Words []wordBox
+}
+
+type wordBox struct {
+	Text string
+	X0   float64
+	Y0   float64
+	X1   float64
+	Y1   float64
+	// Line — номер строки в выдаче движка (с 1), Seq — порядок слова в этой
+	// выдаче. Ноль — неизвестно (tesseract, старый сервис, тесты). См.
+	// readorder.go: порядок слов внутри строки берётся отсюда, а не из X.
+	Line int
+	Seq  int
+}
+
+// layoutFromBoxes собирает из слов с координатами два текста: с ячейками и
+// плоский. gapFactor — во сколько средних ширин символа должен быть разрыв,
+// чтобы считать его границей колонки.
+func layoutFromBoxes(words []wordBox, gapFactor float64) pageText {
+	if len(words) == 0 {
+		return pageText{}
+	}
+	if gapFactor <= 0 {
+		gapFactor = 2.5
+	}
+
+	heights := make([]float64, 0, len(words))
+	charWidths := make([]float64, 0, len(words))
+	for _, w := range words {
+		if h := w.Y1 - w.Y0; h > 0 {
+			heights = append(heights, h)
+		}
+		if n := len([]rune(w.Text)); n > 0 {
+			if cw := (w.X1 - w.X0) / float64(n); cw > 0 {
+				charWidths = append(charWidths, cw)
+			}
+		}
+	}
+	lineHeight := median(heights)
+	if lineHeight <= 0 {
+		lineHeight = 10
+	}
+	charWidth := median(charWidths)
+	if charWidth <= 0 {
+		charWidth = 5
+	}
+
+	sorted := make([]wordBox, len(words))
+	copy(sorted, words)
+	sort.SliceStable(sorted, func(i, j int) bool { return sorted[i].Y0 < sorted[j].Y0 })
+
+	var rows [][]wordBox
+	cur := []wordBox{sorted[0]}
+	curTop := sorted[0].Y0
+	for _, w := range sorted[1:] {
+		if math.Abs(w.Y0-curTop) < lineHeight*0.6 {
+			cur = append(cur, w)
+			continue
+		}
+		rows = append(rows, cur)
+		cur = []wordBox{w}
+		curTop = w.Y0
+	}
+	rows = append(rows, cur)
+
+	var layout, flat strings.Builder
+	gap := charWidth * gapFactor
+	for _, row := range rows {
+		sort.SliceStable(row, func(i, j int) bool { return row[i].X0 < row[j].X0 })
+		var cell, line strings.Builder
+		prevRight := math.Inf(-1)
+		for i, w := range row {
+			if i > 0 {
+				line.WriteByte(' ')
+				if w.X0-prevRight > gap {
+					cell.WriteString(" | ")
+				} else {
+					cell.WriteByte(' ')
+				}
+			}
+			cell.WriteString(w.Text)
+			line.WriteString(w.Text)
+			prevRight = w.X1
+		}
+		layout.WriteString(strings.TrimRight(cell.String(), " "))
+		layout.WriteByte('\n')
+		flat.WriteString(strings.TrimRight(line.String(), " "))
+		flat.WriteByte('\n')
+	}
+	return pageText{Layout: layout.String(), Flat: flat.String(), Words: words}
+}
+
+func median(v []float64) float64 {
+	if len(v) == 0 {
+		return 0
+	}
+	s := make([]float64, len(v))
+	copy(s, v)
+	sort.Float64s(s)
+	return s[len(s)/2]
+}
+
+// tesseractTSV прогоняет страницу через tesseract в режиме tsv и собирает
+// слова с координатами. Один запуск даёт и раскладку, и плоский текст —
+// второй проход по тому же изображению не нужен.
+func tesseractTSV(ctx context.Context, cfg config.OCRConfig, imagePath string) (pageText, error) {
+	cmd := exec.CommandContext(ctx, cfg.TesseractBin,
+		imagePath, "stdout",
+		"-l", cfg.Languages,
+		"--oem", "1",
+		"--psm", "6",
+		"tsv",
+	)
+	out, err := cmd.Output()
+	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			return pageText{}, errTesseract(string(ee.Stderr))
+		}
+		return pageText{}, err
+	}
+	return parseTesseractTSV(string(out), cfg.LayoutGap), nil
+}
+
+func parseTesseractTSV(tsv string, gapFactor float64) pageText {
+	lines := strings.Split(tsv, "\n")
+	words := make([]wordBox, 0, len(lines))
+	for i, line := range lines {
+		if i == 0 || strings.TrimSpace(line) == "" {
+			continue // заголовок таблицы tsv
+		}
+		f := strings.Split(line, "\t")
+		if len(f) < 12 {
+			continue
+		}
+		text := strings.TrimSpace(f[11])
+		if text == "" {
+			continue
+		}
+		if conf, err := strconv.ParseFloat(f[10], 64); err == nil && conf < 0 {
+			continue
+		}
+		left, e1 := strconv.ParseFloat(f[6], 64)
+		top, e2 := strconv.ParseFloat(f[7], 64)
+		width, e3 := strconv.ParseFloat(f[8], 64)
+		height, e4 := strconv.ParseFloat(f[9], 64)
+		if e1 != nil || e2 != nil || e3 != nil || e4 != nil {
+			continue
+		}
+		words = append(words, wordBox{
+			Text: text, X0: left, Y0: top, X1: left + width, Y1: top + height,
+		})
+	}
+	return layoutFromBoxes(words, gapFactor)
+}
+
+type tesseractError string
+
+func (e tesseractError) Error() string { return "tesseract: " + string(e) }
+
+func errTesseract(stderr string) error {
+	return tesseractError(strings.TrimSpace(stderr))
+}

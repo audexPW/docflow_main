@@ -1,0 +1,273 @@
+package recognize
+
+import (
+	"math"
+	"sort"
+	"strings"
+
+	"docflow/internal/domain"
+)
+
+// PDFScanTableRepair — консервативный резервный разбор таблицы скана по bbox
+// слов. Он включается только для PDF и только тогда, когда текущая таблица
+// имеет явные признаки поломанной сетки. Нормальные таблицы не заменяются.
+func PDFScanTableRepair(words []wordBox) *domain.FreeTable {
+	rows := pdfScanRows(words)
+	if len(rows) < 3 {
+		return nil
+	}
+
+	head, first, last := findTableBand(rows)
+	if head < 0 || first < 0 || last < first {
+		return nil
+	}
+	data := dataRows(rows[first : last+1])
+	if len(data) < 2 {
+		return nil
+	}
+
+	bands := pdfScanStableBands(data)
+	if len(bands) < 3 || len(bands) > 16 {
+		return nil
+	}
+
+	cols := headerTitles(headerRowsAbove(rows, head, first, bands), bands)
+	if len(cols) != len(bands) || pdfScanKnownHeaderRoles(cols) < 3 {
+		return nil
+	}
+
+	ft := &domain.FreeTable{
+		Columns: cols,
+		Roles:   rolesFor(cols),
+		Source:  "pdfscan-repair",
+	}
+
+	for i := first; i <= last; i++ {
+		cells := rowCells(rows[i], bands)
+		joined := strings.TrimSpace(strings.Join(cells, " "))
+		if joined == "" || isNumberingRow(cells) {
+			continue
+		}
+		if reTotalsRow.MatchString(joined) {
+			ft.Totals = cells
+			continue
+		}
+		if len(ft.Rows) > 0 && isNameContinuation(cells, ft.Roles) {
+			appendToFreeName(ft.Rows[len(ft.Rows)-1], cells, ft.Roles)
+			continue
+		}
+		if !hasLetters(joined) && !reNumberish.MatchString(joined) {
+			continue
+		}
+		ft.Rows = append(ft.Rows, cells)
+	}
+
+	ft.Rows = dropDegenerateRows(ft.Rows)
+	if len(ft.Rows) == 0 || pdfScanDataQuality(ft) < 0.50 {
+		return nil
+	}
+	return ft
+}
+
+func pdfScanRows(words []wordBox) []tokenRow {
+	toks := make([]token, 0, len(words))
+	for _, w := range words {
+		t := normalizeNoSign(StripMath(strings.TrimSpace(w.Text)))
+		if t == "" || w.X1 <= w.X0 || w.Y1 <= w.Y0 {
+			continue
+		}
+		toks = append(toks, token{Text: t, X0: w.X0, Y0: w.Y0, X1: w.X1, Y1: w.Y1})
+	}
+	if len(toks) < 8 {
+		return nil
+	}
+	return groupTokenRows(toks)
+}
+
+// pdfScanStableBands ищет вертикальные границы, которые присутствуют как
+// пустой зазор минимум в 80% строк данных. В отличие от объединения всех
+// боксов страницы, длинная первая ячейка не может уничтожить границы справа.
+func pdfScanStableBands(rows []tokenRow) [][2]float64 {
+	var widths []float64
+	minX, maxX := math.Inf(1), math.Inf(-1)
+	for _, r := range rows {
+		for _, t := range r.Toks {
+			minX = math.Min(minX, t.X0)
+			maxX = math.Max(maxX, t.X1)
+			if n := len([]rune(t.Text)); n > 0 {
+				if w := (t.X1 - t.X0) / float64(n); w > 0 {
+					widths = append(widths, w)
+				}
+			}
+		}
+	}
+	if math.IsInf(minX, 1) || maxX <= minX {
+		return nil
+	}
+	charW := median(widths)
+	if charW <= 0 {
+		charW = 5
+	}
+
+	step := math.Max(1, math.Min(3, charW/3))
+	threshold := int(math.Ceil(float64(len(rows)) * 0.80))
+	if threshold < 2 {
+		threshold = 2
+	}
+
+	type gap struct{ a, b float64 }
+	var gaps []gap
+	inGap := false
+	gapStart, lastX := minX, minX
+
+	flush := func(end float64) {
+		if inGap && end-gapStart >= math.Max(3, charW*0.9) {
+			gaps = append(gaps, gap{a: gapStart, b: end})
+		}
+		inGap = false
+	}
+
+	for x := minX; x <= maxX; x += step {
+		empty := 0
+		for _, r := range rows {
+			covered := false
+			for _, t := range r.Toks {
+				if x >= t.X0 && x <= t.X1 {
+					covered = true
+					break
+				}
+			}
+			if !covered {
+				empty++
+			}
+		}
+		if empty >= threshold {
+			if !inGap {
+				inGap = true
+				gapStart = x
+			}
+			lastX = x
+			continue
+		}
+		if inGap {
+			flush(lastX)
+		}
+		lastX = x
+	}
+	flush(lastX)
+
+	sort.Slice(gaps, func(i, j int) bool { return gaps[i].a < gaps[j].a })
+	merged := make([]gap, 0, len(gaps))
+	for _, g := range gaps {
+		if len(merged) == 0 || g.a-merged[len(merged)-1].b > charW*1.5 {
+			merged = append(merged, g)
+			continue
+		}
+		if g.b > merged[len(merged)-1].b {
+			merged[len(merged)-1].b = g.b
+		}
+	}
+
+	// Очень много кандидатов означает, что OCR оставил слишком много внутренних
+	// пробелов. Берём самые широкие/устойчивые только в этом защитном режиме.
+	if len(merged) > 15 {
+		merged = merged[:15]
+	}
+
+	bands := make([][2]float64, 0, len(merged)+1)
+	left := minX - charW
+	for _, g := range merged {
+		cut := (g.a + g.b) / 2
+		if cut-left < charW {
+			continue
+		}
+		bands = append(bands, [2]float64{left, cut})
+		left = cut
+	}
+	bands = append(bands, [2]float64{left, maxX + charW})
+	return bands
+}
+
+func pdfScanKnownHeaderRoles(cols []string) int {
+	seen := map[string]bool{}
+	for _, c := range cols {
+		r := guessRole(c)
+		if r != "" && r != "other" {
+			seen[r] = true
+		}
+	}
+	return len(seen)
+}
+
+func pdfScanDataQuality(ft *domain.FreeTable) float64 {
+	if ft == nil || len(ft.Rows) == 0 {
+		return 0
+	}
+	rowsWithNumbers, nonEmpty, numeric := 0, 0, 0
+	for _, row := range ft.Rows {
+		hasNum := false
+		for _, v := range row {
+			v = strings.TrimSpace(v)
+			if v == "" {
+				continue
+			}
+			nonEmpty++
+			if reNumberish.MatchString(v) {
+				numeric++
+				hasNum = true
+			}
+		}
+		if hasNum {
+			rowsWithNumbers++
+		}
+	}
+	if nonEmpty == 0 {
+		return 0
+	}
+	return 0.6*(float64(rowsWithNumbers)/float64(len(ft.Rows))) +
+		0.4*(float64(numeric)/float64(nonEmpty))
+}
+
+// pdfScanShouldReplace не трогает нормальный grid. Замена разрешена, когда
+// repair восстановил как минимум две дополнительные графы и у текущего grid
+// есть явные признаки сломанной сетки: пустые/дублирующиеся заголовки.
+func pdfScanShouldReplace(current *domain.Table, repaired *domain.FreeTable) bool {
+	if repaired == nil || len(repaired.Columns) < 3 || len(repaired.Rows) == 0 {
+		return false
+	}
+	if pdfScanKnownHeaderRoles(repaired.Columns) < 3 {
+		return false
+	}
+	if current == nil || current.RawCells == nil {
+		return true
+	}
+
+	old := len(current.Columns)
+	newN := len(repaired.Columns)
+	if newN < old+2 {
+		return false
+	}
+
+	blanks, repeats := 0, 0
+	seen := map[string]bool{}
+	for _, c := range current.Columns {
+		v := strings.TrimSpace(strings.ToLower(c.Title))
+		if v == "" {
+			blanks++
+			continue
+		}
+		if seen[v] {
+			repeats++
+		}
+		seen[v] = true
+	}
+
+	return blanks >= 2 || repeats >= 1 || newN >= old+3
+}
+
+func pdfScanCurrentColumnCount(t *domain.Table) int {
+	if t == nil {
+		return 0
+	}
+	return len(t.Columns)
+}

@@ -1,0 +1,147 @@
+package onec
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+
+	"docflow/internal/config"
+	"docflow/internal/domain"
+	"docflow/internal/recognize"
+)
+
+// Payload — плоское представление документа для передачи в 1С.
+//
+// Kind различает вид выгрузки, Incomplete/Missing показывают 1С, что документ
+// пришёл не полностью и часть полей будет дослана. DocumentID стабилен между
+// частичной выгрузкой и досылкой — 1С сопоставляет их по нему (upsert).
+type Payload struct {
+	DocumentID   string   `json:"document_id"`
+	Kind         string   `json:"kind"`
+	Incomplete   bool     `json:"incomplete"`
+	Missing      []string `json:"missing,omitempty"`
+	DocType      string   `json:"doc_type"`
+	DocTypeTitle string   `json:"doc_type_title,omitempty"`   // подпись типа для человека
+	OneCObject   string   `json:"onec_object,omitempty"`      // объект метаданных 1С, куда класть документ
+	OneCKind     string   `json:"onec_object_kind,omitempty"` // document | catalog | file
+	Number       string   `json:"number,omitempty"`
+	Date         string   `json:"date,omitempty"`
+	Total        string   `json:"total,omitempty"`
+	VATAmount    string   `json:"vat_amount,omitempty"` // сумма НДС по документу
+	Currency     string   `json:"currency,omitempty"`
+	AmountNoVAT    string `json:"amount_no_vat,omitempty"`
+	ContractNumber string `json:"contract_number,omitempty"`
+	ContractDate   string `json:"contract_date,omitempty"`
+	UNP          string   `json:"unp,omitempty"` // Беларусь: учётный номер плательщика
+	INN          string   `json:"inn,omitempty"` // Россия
+	KPP          string   `json:"kpp,omitempty"`
+	Counterpty   string   `json:"counterparty,omitempty"`
+	Organization string   `json:"organization,omitempty"`     // своя фирма заказчика
+	OrgTaxID     string   `json:"organization_unp,omitempty"` // её УНП/ИНН — ключ поиска организации
+
+	// Компания (юрлицо), к которой относится документ: её папка обмена и
+	// реквизиты. 1С по ним понимает, в какую базу/организацию класть документ,
+	// а файловая выгрузка — в какую папку его положить.
+	CompanyName   string `json:"company_name,omitempty"`
+	CompanyUNP    string `json:"company_unp,omitempty"`
+	CompanyFolder string `json:"company_folder,omitempty"`
+
+	// Счета бухгалтерского учёта, подобранные по содержимому документа.
+	// Приёмнику остаётся подставить их в проводку, а не спрашивать бухгалтера.
+	AccountDebit  string `json:"account_debit,omitempty"`
+	AccountCredit string `json:"account_credit,omitempty"`
+	AccountVAT    string `json:"account_vat,omitempty"`
+
+	Lines []domain.LineItem `json:"lines,omitempty"`
+	// Table — табличная часть со структурой колонок. Именно она нужна
+	// приёмнику: строки уже разложены по ячейкам, разбирать текст не надо.
+	Table    *domain.Table     `json:"table,omitempty"`
+	Fields   map[string]string `json:"fields"`
+	FileName string            `json:"file_name,omitempty"`
+}
+
+func BuildPayload(doc domain.Document, kind domain.ExportKind) Payload {
+	p := Payload{
+		DocumentID:  doc.ID.String(),
+		Kind:        string(kind),
+		FileName:    doc.OriginalName,
+		CompanyName: doc.CompanyName,
+		Fields:      map[string]string{},
+	}
+	if doc.Recognition != nil {
+		p.DocType = doc.Recognition.DocType
+		// Маршрут в 1С считаем здесь, а не в приёмнике: реестр типов —
+		// единственное место, где записано соответствие «тип → объект базы».
+		p.DocTypeTitle = recognize.DocTypeTitle(p.DocType)
+		target := recognize.OneCTargetFor(p.DocType)
+		p.OneCObject = target.Object
+		p.OneCKind = target.Kind
+		for k, f := range doc.Recognition.Fields {
+			if f.Value != "" {
+				p.Fields[k] = f.Value
+			}
+		}
+		p.Lines = doc.Recognition.Lines
+		p.Table = doc.Recognition.Table
+		p.Missing = doc.Recognition.Missing
+		p.Incomplete = len(doc.Recognition.Missing) > 0
+	}
+	p.Number = p.Fields["number"]
+	p.Date = p.Fields["date"]
+	p.Total = p.Fields["total"]
+	p.VATAmount = p.Fields["vat_amount"]
+	p.Currency = p.Fields["currency"]
+	p.AmountNoVAT = p.Fields["amount_no_vat"]
+	p.ContractNumber = p.Fields["contract_number"]
+	p.ContractDate = p.Fields["contract_date"]
+	p.UNP = p.Fields["unp"]
+	p.INN = p.Fields["inn"]
+	p.KPP = p.Fields["kpp"]
+	p.Counterpty = p.Fields["counterparty"]
+	p.Organization = p.Fields["organization"]
+	p.OrgTaxID = p.Fields["organization_unp"]
+	p.AccountDebit = p.Fields[recognize.FieldAccountDebit]
+	p.AccountCredit = p.Fields[recognize.FieldAccountCredit]
+	p.AccountVAT = p.Fields[recognize.FieldAccountVAT]
+	return p
+}
+
+// WithCompany дополняет выгрузку реквизитами юрлица. Вынесено отдельно, потому
+// что компания читается из своей таблицы, а BuildPayload работает только с
+// документом.
+func (p Payload) WithCompany(c domain.Company) Payload {
+	p.CompanyName = c.Name
+	p.CompanyUNP = c.UNP
+	p.CompanyFolder = c.Folder
+	return p
+}
+
+// Exporter отправляет подтверждённый документ в 1С. Реализация выбирается по
+// конфигурации: прямой REST, файловый обмен или заглушка.
+type Exporter interface {
+	Export(ctx context.Context, p Payload) error
+}
+
+func NewExporter(cfg config.OneCConfig, log *slog.Logger) (Exporter, error) {
+	switch cfg.Mode {
+	case "rest":
+		if cfg.RESTURL == "" {
+			return nil, fmt.Errorf("ONEC_REST_URL is required for rest mode")
+		}
+		return newRESTExporter(cfg), nil
+	case "enterprisedata", "file":
+		return newFileExporter(cfg)
+	case "disabled", "":
+		log.Warn("1C export is disabled; confirmed documents will be marked done without sending")
+		return nullExporter{log: log}, nil
+	default:
+		return nil, fmt.Errorf("unknown ONEC_MODE %q", cfg.Mode)
+	}
+}
+
+type nullExporter struct{ log *slog.Logger }
+
+func (n nullExporter) Export(_ context.Context, p Payload) error {
+	n.log.Info("1C export skipped (disabled)", "document_id", p.DocumentID)
+	return nil
+}

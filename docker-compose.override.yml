@@ -1,0 +1,9 @@
+services:
+  docflow-backend:
+    volumes:
+      - ./trace:/var/lib/docflow/trace
+      - /srv/docflow/onec_outbox:/var/lib/docflow/onec_outbox
+      - ./accounts.json:/etc/docflow/accounts.json:ro
+  surya-ocr:
+    volumes:
+      - ./models/datalab:/root/.cache/datalab

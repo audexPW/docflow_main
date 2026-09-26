@@ -1,0 +1,26 @@
+node_modules
+dist
+.env
+.env.local
+*.log
+.DS_Store
+
+# Нативные проекты android/ и ios/ ХРАНЯТСЯ в репозитории: в них лежат
+# разрешения, иконки, версии и подписи, без которых сборку не воспроизвести.
+# Игнорируем только артефакты сборки.
+android/.gradle/
+android/.idea/
+android/build/
+android/app/build/
+android/app/src/main/assets/public/
+android/local.properties
+android/app/release/
+android/app/*.keystore
+android/keystore.properties
+
+ios/App/build/
+ios/App/Pods/
+ios/App/App/public/
+ios/App/output/
+ios/DerivedData/
+*.xcuserdatad
