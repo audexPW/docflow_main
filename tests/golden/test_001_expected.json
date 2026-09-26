@@ -1,0 +1,14 @@
+{
+  "doc_type": "schet_faktura",
+  "document_number": "1333",
+  "document_date": "20.02.2023",
+  "contract_number": "181/22",
+  "seller": "Белорусский государственный университет",
+  "seller_unp": "100235722",
+  "buyer": "ООО \"КофеВенд\"",
+  "buyer_unp": "590888079",
+  "currency": "BYN",
+  "amount_no_vat": "5.79",
+  "vat_amount": "1.16",
+  "total": "6.95"
+}
