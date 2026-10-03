@@ -74,6 +74,15 @@ func (s *Server) Handler() http.Handler {
 	// Документы
 	mux.HandleFunc("GET /api/doctypes", s.auth(s.handleListDocTypes, allRoles...))
 	mux.HandleFunc("POST /api/documents", s.auth(s.handleUploadDocument, domain.RoleClient, domain.RoleOperator, domain.RoleAdmin))
+
+	mux.HandleFunc(
+		"DELETE /api/test/documents/{id}",
+		s.auth(
+			s.handleDeleteTestDocument,
+			domain.RoleOperator,
+			domain.RoleAdmin,
+		),
+	)
 	mux.HandleFunc("GET /api/documents", s.auth(s.handleListDocuments, allRoles...))
 	mux.HandleFunc("GET /api/documents/{id}", s.auth(s.handleGetDocument, allRoles...))
 	mux.HandleFunc("GET /api/documents/{id}/file", s.auth(s.handleDownloadFile, allRoles...))

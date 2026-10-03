@@ -493,6 +493,62 @@ func (s *Server) handleListDocTypes(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"types": out})
 }
 
+func (s *Server) handleDeleteTestDocument(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseID(w, r)
+	if !ok {
+		return
+	}
+
+	doc, err := s.db.Document(r.Context(), id)
+	if err != nil {
+		respondNotFound(w, err, s)
+		return
+	}
+
+	if err := s.files.Remove(doc.StorageKey); err != nil {
+		s.log.Error(
+			"remove test document file",
+			"error",
+			err,
+			"document_id",
+			id,
+		)
+		writeError(
+			w,
+			http.StatusInternalServerError,
+			"could not remove file",
+		)
+		return
+	}
+
+	if err := s.db.DeleteDocument(
+		r.Context(),
+		id,
+	); err != nil {
+		s.log.Error(
+			"delete test document",
+			"error",
+			err,
+			"document_id",
+			id,
+		)
+		writeError(
+			w,
+			http.StatusInternalServerError,
+			"could not delete document",
+		)
+		return
+	}
+
+	writeJSON(
+		w,
+		http.StatusOK,
+		map[string]string{
+			"status": "deleted",
+		},
+	)
+}
+
 type docTypeView struct {
 	Slug       string   `json:"slug"`
 	Title      string   `json:"title"`
