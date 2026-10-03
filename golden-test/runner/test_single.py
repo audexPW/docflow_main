@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from config_loader import load_config
+from docflow_client import delete_document
 
 
 # Настройки
@@ -99,33 +100,42 @@ def wait_result(token, document_id):
 def main():
 
     token = login()
+    document_id = None
 
-    document_id = upload_document(token)
+    try:
+        document_id = upload_document(token)
 
-    result = wait_result(
-        token,
-        document_id
-    )
-
-    RESULT_PATH.parent.mkdir(
-        exist_ok=True
-    )
-
-    with open(
-        RESULT_PATH,
-        "w",
-        encoding="utf-8"
-    ) as f:
-        json.dump(
-            result,
-            f,
-            ensure_ascii=False,
-            indent=2
+        result = wait_result(
+            token,
+            document_id
         )
 
-    print()
-    print("Результат сохранён:")
-    print(RESULT_PATH)
+        RESULT_PATH.parent.mkdir(
+            exist_ok=True
+        )
+
+        with open(
+            RESULT_PATH,
+            "w",
+            encoding="utf-8"
+        ) as f:
+            json.dump(
+                result,
+                f,
+                ensure_ascii=False,
+                indent=2
+            )
+
+        print()
+        print("Результат сохранён:")
+        print(RESULT_PATH)
+
+    finally:
+        if document_id is not None:
+            delete_document(
+                token,
+                document_id
+            )
 
 
 if __name__ == "__main__":
