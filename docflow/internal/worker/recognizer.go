@@ -192,6 +192,18 @@ func (r *Recognizer) step(ctx context.Context) (bool, error) {
 		}
 	}
 
+	// Golden Dataset использует выделенную учётку golden_test, но общую очередь
+	// документов с Production. Какой именно backend-worker заберёт документ,
+	// заранее неизвестно. Поэтому тестовый документ распознаётся полностью,
+	// но никогда не ставится в очередь экспорта в 1С.
+	owner, ownerErr := r.db.UserByID(ctx, doc.OwnerID)
+	if ownerErr != nil {
+		r.log.Warn("не удалось определить владельца документа", "id", doc.ID, "error", ownerErr)
+	} else if owner.Login == "golden_test" {
+		status = domain.StatusNeedsReview
+		r.log.Info("golden test document: export disabled", "id", doc.ID)
+	}
+
 	if err := r.db.SaveRecognition(ctx, doc.ID, rec, res.OCRText, status); err != nil {
 		return true, err
 	}
