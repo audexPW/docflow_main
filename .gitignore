@@ -93,3 +93,19 @@ Thumbs.db
 coverage/
 .coverage
 coverage.out
+
+# ------------------------------------------------------------
+# Golden Dataset - private/local data and generated artifacts
+# ------------------------------------------------------------
+/golden_dataset/
+/golden_export/
+/golden_export.tar.gz
+/golden_manifest.csv
+/golden_selection.csv
+
+# Generated Golden Dataset executable
+/docflow/goldendataset
+
+# Active local test compose contains runtime secrets.
+# Keep only a sanitized template in Git.
+/docker-compose.secondary.yml
