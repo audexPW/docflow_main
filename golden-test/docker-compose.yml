@@ -1,6 +1,6 @@
 services:
   golden-backend:
-    image: docflow-deploy-docflow-backend:latest
+    image: ${GOLDEN_BACKEND_IMAGE:-docflow-deploy-docflow-backend:latest}
     container_name: docflow-golden-backend
     restart: "no"
 
