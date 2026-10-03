@@ -1,0 +1,12 @@
+targets:
+
+  production:
+    enabled: true
+    url: http://docflow-backend:8080
+    description: "Основной DocFlow"
+
+
+  experiment:
+    enabled: true
+    url: http://localhost:18080
+    description: "Побочный DocFlow"

@@ -1,0 +1,61 @@
+services:
+  golden-backend:
+    image: docflow-deploy-docflow-backend:latest
+    container_name: docflow-golden-backend
+    restart: "no"
+
+    env_file:
+      - ../.env
+
+    environment:
+      HTTP_ADDR: ":8080"
+
+    ports:
+      - "18080:8080"
+
+    volumes:
+      - docflow_files:/var/lib/docflow
+      - ../doctypes.json:/etc/docflow/doctypes.json:ro
+      - ../accounts.json:/etc/docflow/accounts.json:ro
+
+    networks:
+      - docflow-deploy_default
+
+    healthcheck:
+      test: ["CMD", "/app/docflow", "-healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  golden-test:
+    build:
+      context: .
+    container_name: docflow-golden-test-runner
+    restart: "no"
+
+    depends_on:
+      golden-backend:
+        condition: service_healthy
+
+    volumes:
+      # Здесь уже лежит Golden Dataset 001-091 и старые reports.
+      - /opt/docflow-golden-test:/app
+
+      # Но runner и config берём из постоянной версии в main.
+      - ./runner:/app/runner:ro
+      - ./config:/app/config:ro
+
+    networks:
+      - docflow-deploy_default
+
+    command: ["python", "runner/run_secondary.py"]
+
+volumes:
+  docflow_files:
+    external: true
+    name: docflow-deploy_docflow_files
+
+networks:
+  docflow-deploy_default:
+    external: true

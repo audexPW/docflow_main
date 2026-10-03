@@ -109,3 +109,10 @@ coverage.out
 # Active local test compose contains runtime secrets.
 # Keep only a sanitized template in Git.
 /docker-compose.secondary.yml
+
+# Golden Test runtime
+/golden-test/config/secondary.yaml
+/golden-test/reports/
+/golden-test/[0-9][0-9][0-9]/
+/golden-test/*.zip
+/golden-test/runner/__pycache__/

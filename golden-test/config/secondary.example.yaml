@@ -1,0 +1,17 @@
+name: secondary
+
+docflow:
+  url: http://golden-backend:8080
+
+auth:
+  login: golden_test
+  password: "<set-on-server>"
+
+dataset:
+  path: .
+
+reports:
+  path: reports/secondary
+
+cleanup:
+  enabled: true
