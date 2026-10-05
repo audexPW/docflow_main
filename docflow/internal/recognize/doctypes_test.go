@@ -12,7 +12,10 @@ func TestNormalizeDocTypeAcceptsModelWording(t *testing.T) {
 		"ТТН":                "waybill",
 		"invoice":            "invoice",
 		"Счёт на оплату":     "invoice",
+		"Счёт-фактура":      "invoice",
+		"Счет на предоплату": "invoice",
 		"ЭСЧФ":               "schet_faktura",
+		"Электронный счет-фактура": "schet_faktura",
 		"Акт сверки":         "act_sverki",
 		"Доверенность":       "power_of_attorney",
 		"":                   DocTypeUnknown,
@@ -100,12 +103,31 @@ func TestLoadDocTypesMergesMappingAndAddsTypes(t *testing.T) {
 	}
 }
 
-func TestClassifyIgnoresYoAndCase(t *testing.T) {
-	if dt, _ := classifyByRules("СЧЕТ-ФАКТУРА №12"); dt != "schet_faktura" {
-		t.Fatalf("got %q", dt)
+func TestClassifyDocumentTypeBusinessTaxonomy(t *testing.T) {
+	cases := []struct {
+		text string
+		want string
+	}{
+		// Обычный бумажный счет-фактура относится к invoice.
+		// schet_faktura зарезервирован под ЭСЧФ.
+		{"СЧЕТ-ФАКТУРА №12", "invoice"},
+		{"Счет-фактура № 182 от 28 февраля 2023 г.", "invoice"},
+
+		// Предоплата — разновидность счета.
+		{"Счет на предоплату коммунальных услуг №15", "invoice"},
+
+		// schet_faktura используем только для ЭСЧФ.
+		{"ЭСЧФ №123", "schet_faktura"},
+		{"Электронный счет-фактура №123", "schet_faktura"},
+
+		// Существующее различение актов приемки сохраняем.
+		{"акт приёмки-передачи оборудования", "act_priemki"},
 	}
-	if dt, _ := classifyByRules("акт приёмки-передачи оборудования"); dt != "act_priemki" {
-		t.Fatalf("got %q", dt)
+
+	for _, tc := range cases {
+		if got, _ := classifyByRules(tc.text); got != tc.want {
+			t.Errorf("classifyByRules(%q) = %q, want %q", tc.text, got, tc.want)
+		}
 	}
 }
 
