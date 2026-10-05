@@ -22,13 +22,13 @@ func TestModelDocTypeClosedList(t *testing.T) {
 	if got := NormalizeModelDocType("Справка о чём-то своём"); got != DocTypeUnknown {
 		t.Fatalf("выдуманный тип принят как %q", got)
 	}
-	if got := NormalizeModelDocType("Счёт-фактура"); got != "schet_faktura" {
+	if got := NormalizeModelDocType("Счёт-фактура"); got != "invoice" {
 		t.Fatalf("got %q", got)
 	}
 }
 
 func TestResolveDocTypeConfidenceIsMeasured(t *testing.T) {
-	head := "СЧЕТ-ФАКТУРА № 42 от 31 июля 2023"
+	head := "ЭСЧФ № 42 от 31 июля 2023"
 	_, agree := ResolveDocType("schet_faktura", 1, "schet_faktura", head)
 	_, modelOnlyEvidence := ResolveDocType(DocTypeUnknown, 0, "schet_faktura", head)
 	_, modelOnlyBare := ResolveDocType(DocTypeUnknown, 0, "schet_faktura", "без названия")

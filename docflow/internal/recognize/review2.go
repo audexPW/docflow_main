@@ -88,26 +88,42 @@ func NormalizeModelDocType(raw string) string {
 
 // typeEvidenceInText — в шапке документа напечатано название типа.
 func typeEvidenceInText(docType, text string) bool {
-	spec, ok := LookupDocType(docType)
-	if !ok {
-		return false
-	}
-	low := strings.ToLower(strings.ReplaceAll(text, "ё", "е"))
-	if len(low) > 1200 {
-		low = low[:1200]
-	}
-	for _, a := range append(append([]string{spec.Title}, spec.Anchors...), spec.Synonyms...) {
-		a = strings.ToLower(strings.ReplaceAll(strings.TrimSpace(a), "ё", "е"))
-		// Однословные синонимы («счет», «акт») слишком общие для
-		// свидетельства.
-		if len([]rune(a)) < 6 {
-			continue
-		}
-		if strings.Contains(low, a) {
-			return true
-		}
-	}
-	return false
+	 spec, ok := LookupDocType(docType)
+	 if !ok {
+		 return false
+	 }
+	 low := strings.ToLower(strings.ReplaceAll(text, "ё", "е"))
+	 if len(low) > 1200 {
+		 low = low[:1200]
+	 }
+
+	 normalize := func(a string) string {
+		 return strings.ToLower(strings.ReplaceAll(strings.TrimSpace(a), "ё", "е"))
+	 }
+
+	 // Title и Anchors — специально заданные сильные признаки типа.
+	 // Короткие аббревиатуры вроде «ЭСЧФ» и «УПД» здесь допустимы:
+	 // их нельзя отбрасывать только из-за длины.
+	 for _, a := range append([]string{spec.Title}, spec.Anchors...) {
+		 a = normalize(a)
+		 if a != "" && strings.Contains(low, a) {
+			 return true
+		 }
+	 }
+
+	 // Короткие синонимы («счет», «акт», «чек») слишком общие,
+	 // поэтому сами по себе сильным свидетельством типа не являются.
+	 for _, a := range spec.Synonyms {
+		 a = normalize(a)
+		 if len([]rune(a)) < 6 {
+			 continue
+		 }
+		 if strings.Contains(low, a) {
+			 return true
+		 }
+	 }
+
+	 return false
 }
 
 // ResolveDocType сводит тип правил и тип модели и считает уверенность.
