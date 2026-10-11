@@ -158,6 +158,7 @@ def main():
             "expected": expected_doc_type,
             "actual": actual_doc_type,
             "match": effective_doc_type(expected_doc_type) == effective_doc_type(actual_doc_type),
+            "exact_code_match": expected_doc_type == actual_doc_type,
             "match_basis": "effective_business_type"
         },
 
