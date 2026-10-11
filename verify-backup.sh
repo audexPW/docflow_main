@@ -89,6 +89,13 @@ mkdir -p "$TMPDIR/restore"
 tar -xzf "$BACKUP/files.tar.gz" -C "$TMPDIR/restore"
 FILES_ROOT="$(find "$TMPDIR/restore" -maxdepth 2 -type d -name files | head -1)"
 [ -n "$FILES_ROOT" ] || FILES_ROOT="$TMPDIR/restore"
+
+# Временная распаковка выполняется пользователем host.
+# backupcheck внутри backend image работает как uid=10001 (docflow),
+# поэтому даём ему только чтение файлов и traversal каталогов.
+# Меняется ТОЛЬКО содержимое mktemp; production и backup-архив не затрагиваются.
+find "$FILES_ROOT" -type d -exec chmod a+rx {} +
+find "$FILES_ROOT" -type f -exec chmod a+r {} +
 ok "распаковано: $(find "$FILES_ROOT" -type f | wc -l) файл(ов)"
 
 # --- собственно проверка ----------------------------------------------------
