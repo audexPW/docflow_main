@@ -4,6 +4,10 @@
 
 export const docTypeLabels = {
   schet_faktura: 'Счёт-фактура',
+  act_priemki: 'Акт приёмки-передачи',
+  act_sverki: 'Акт сверки взаиморасчётов',
+  payment_order: 'Платёжное поручение',
+  power_of_attorney: 'Доверенность',
   upd: 'УПД',
   invoice: 'Счёт на оплату',
   waybill: 'Товарная накладная',
@@ -17,13 +21,11 @@ export const docTypeLabels = {
 // там же задано, в какой объект 1С попадает каждый тип. Фронтенд подтягивает
 // его при входе, а список ниже — только запасной вариант, если запрос не прошёл.
 const fallbackOptions = [
-  'schet_faktura',
-  'upd',
-  'invoice',
-  'waybill',
   'act',
-  'receipt',
+  'power_of_attorney',
   'contract',
+  'waybill',
+  'upd',
   'unknown',
 ]
 

@@ -204,6 +204,14 @@ func (r *Recognizer) step(ctx context.Context) (bool, error) {
 		r.log.Info("golden test document: export disabled", "id", doc.ID)
 	}
 
+	// Apply business document type after all recognition and routing checks.
+	originalDocType := rec.DocType
+	rec.DocType = recognize.EffectiveDocType(originalDocType)
+	if originalDocType != rec.DocType {
+		r.log.Info("document type grouped", "id", doc.ID,
+			"source_type", originalDocType, "effective_type", rec.DocType)
+	}
+
 	if err := r.db.SaveRecognition(ctx, doc.ID, rec, res.OCRText, status); err != nil {
 		return true, err
 	}

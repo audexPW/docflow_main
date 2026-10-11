@@ -179,7 +179,11 @@ export default function DocumentDetail() {
     try {
       const fieldMap = {}
       for (const f of fields) fieldMap[f.key] = f.value
-      const updated = await api.updateRecognition(id, { doc_type: docType, fields: fieldMap })
+      const payload = { fields: fieldMap }
+      if (docType !== (doc.recognition?.doc_type || '')) {
+        payload.doc_type = docType
+      }
+      const updated = await api.updateRecognition(id, payload)
       applyDoc(updated)
       setNotice('Изменения сохранены')
     } catch (err) {
