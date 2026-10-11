@@ -67,6 +67,7 @@ def main():
         "extra_on_null": 0,
         "unexpected_actual_fields": 0,
         "doc_type_matches": 0,
+        "doc_type_exact_code_matches": 0,
     }
 
     for number in range(1, 92):
@@ -155,6 +156,10 @@ def main():
         doc_type_match = (
             effective_doc_type(expected_doc_type) ==
             effective_doc_type(actual_doc_type)
+        )
+
+        doc_type_exact_code_match = (
+            expected_doc_type == actual_doc_type
         )
 
         status = actual.get(
@@ -259,6 +264,9 @@ def main():
                 "doc_type_matches"
             ] += 1
 
+        if doc_type_exact_code_match:
+            totals["doc_type_exact_code_matches"] += 1
+
         documents.append({
             "document": doc_id,
             "source_type": extension,
@@ -272,6 +280,9 @@ def main():
 
             "doc_type_match":
                 doc_type_match,
+
+            "doc_type_exact_code_match":
+                doc_type_exact_code_match,
 
             "validated_fields":
                 validated,
@@ -314,6 +325,11 @@ def main():
 
     totals["doc_type_accuracy"] = pct(
         totals["doc_type_matches"],
+        totals["documents"]
+    )
+
+    totals["doc_type_exact_code_accuracy"] = pct(
+        totals["doc_type_exact_code_matches"],
         totals["documents"]
     )
 
@@ -371,6 +387,7 @@ def main():
     analysis = {
         "methodology": {
             "doc_type_comparison": "effective_business_type",
+            "doc_type_exact_code_note": "Diagnostic only: equality of returned type codes. After normalization this is NOT OCR/LLM 11-type accuracy.",
             "doc_type_note": "Raw expected and actual types are preserved; business-type accuracy is not directly comparable to historical 11-type accuracy.",
             "scored": [
                 "doc_type",
@@ -426,6 +443,7 @@ def main():
             "expected_doc_type",
             "actual_doc_type",
             "doc_type_match",
+            "doc_type_exact_code_match",
             "validated_fields",
             "matched",
             "missing",
@@ -533,6 +551,10 @@ def main():
     print(
         "DOC TYPE ACCURACY:",
         f'{totals["doc_type_accuracy"]}%'
+    )
+    print(
+        "EXACT TYPE CODE MATCH (DIAGNOSTIC):",
+        f'{totals["doc_type_exact_code_accuracy"]}%'
     )
 
     print()
