@@ -2,6 +2,8 @@ import json
 import sys
 from pathlib import Path
 
+from effective_doctype import effective_doc_type
+
 
 def load_json(path):
     with open(path, "r", encoding="utf-8") as f:
@@ -155,7 +157,8 @@ def main():
         "doc_type": {
             "expected": expected_doc_type,
             "actual": actual_doc_type,
-            "match": expected_doc_type == actual_doc_type
+            "match": effective_doc_type(expected_doc_type) == effective_doc_type(actual_doc_type),
+            "match_basis": "effective_business_type"
         },
 
 

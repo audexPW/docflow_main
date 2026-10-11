@@ -3,6 +3,7 @@ import json
 from collections import Counter, defaultdict
 from pathlib import Path
 
+from effective_doctype import effective_doc_type
 from compare import (
     compare_fields,
     get_actual_value,
@@ -152,8 +153,8 @@ def main():
         )
 
         doc_type_match = (
-            expected_doc_type ==
-            actual_doc_type
+            effective_doc_type(expected_doc_type) ==
+            effective_doc_type(actual_doc_type)
         )
 
         status = actual.get(
@@ -369,6 +370,8 @@ def main():
 
     analysis = {
         "methodology": {
+            "doc_type_comparison": "effective_business_type",
+            "doc_type_note": "Raw expected and actual types are preserved; business-type accuracy is not directly comparable to historical 11-type accuracy.",
             "scored": [
                 "doc_type",
                 "expected.fields with non-null expected value",

@@ -194,10 +194,10 @@ func (s *Server) handleUpdateRecognition(w http.ResponseWriter, r *http.Request)
 			rec.Fields = map[string]domain.Field{}
 		}
 	}
-	if req.DocType != nil {
+	if req.DocType != nil && *req.DocType != rec.DocType {
 		// Оператор может выбрать тип из списка или вписать свой — приводим к
 		// коду реестра, чтобы выгрузка нашла обязательные поля и объект 1С.
-		rec.DocType = recognize.NormalizeDocType(*req.DocType)
+		rec.DocType = recognize.EffectiveDocType(recognize.NormalizeDocType(*req.DocType))
 	}
 	// Ручные правки оператора считаем достоверными.
 	for k, v := range req.Fields {
@@ -479,9 +479,17 @@ func (s *Server) handleListDocTypes(w http.ResponseWriter, r *http.Request) {
 	specs := recognize.DocTypes()
 	out := make([]docTypeView, 0, len(specs)+1)
 	for _, spec := range specs {
+		// Keep all internal types for recognition; expose only business types.
+		if recognize.EffectiveDocType(spec.Slug) != spec.Slug {
+			continue
+		}
+		title := spec.Title
+		if spec.Slug == "act" {
+			title = "Акт"
+		}
 		out = append(out, docTypeView{
 			Slug:       spec.Slug,
-			Title:      spec.Title,
+			Title:      title,
 			Required:   recognize.RequiredFields(spec.Slug),
 			HasLines:   spec.HasLines,
 			OneCObject: spec.OneC.Object,
