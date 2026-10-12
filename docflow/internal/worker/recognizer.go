@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"time"
 
+	"docflow/internal/config"
 	"docflow/internal/domain"
 	"docflow/internal/push"
 	"docflow/internal/recognize"
@@ -21,17 +22,19 @@ type Recognizer struct {
 	// requireMapping — не отправлять в 1С документ, для типа которого не
 	// согласован объект-приёмник (см. recognize.ExportRoutable).
 	requireMapping bool
+	exportProfile  string
 	log            *slog.Logger
 	idle           time.Duration
 }
 
-func NewRecognizer(db *storage.DB, pipeline *recognize.Pipeline, notifier push.Notifier, autoExport, requireMapping bool, log *slog.Logger) *Recognizer {
+func NewRecognizer(db *storage.DB, pipeline *recognize.Pipeline, notifier push.Notifier, autoExport, requireMapping bool, exportProfile string, log *slog.Logger) *Recognizer {
 	return &Recognizer{
 		db:             db,
 		pipeline:       pipeline,
 		notifier:       notifier,
 		autoExport:     autoExport,
 		requireMapping: requireMapping,
+		exportProfile:  exportProfile,
 		log:            log,
 		idle:           2 * time.Second,
 	}
@@ -137,6 +140,13 @@ func (r *Recognizer) step(ctx context.Context) (bool, error) {
 	missing := recognize.MissingRequired(rec)
 	rec.Missing = missing
 
+	// Keep source-type validation, then normalize the business type
+	// before routing in the new export profile.
+	originalDocType := rec.DocType
+	if r.exportProfile == config.OneCExportProfileTypeInbox {
+		rec.DocType = recognize.EffectiveDocType(originalDocType)
+	}
+
 	// Табличная часть разобрана, но сумма строк не сходится с итогом — значит
 	// колонки разъехались. Такие позиции в 1С не отправляем (лучше без
 	// номенклатуры, чем с неверными суммами), но документ при этом НЕ
@@ -145,7 +155,11 @@ func (r *Recognizer) step(ctx context.Context) (bool, error) {
 	if recognize.LinesTotalMismatch(rec, recognize.LinesTolerance) {
 		r.log.Warn("line items do not reconcile with total, sending header only",
 			"id", doc.ID, "lines", len(rec.Lines), "total", rec.Fields["total"].Value)
-		rec.Lines = nil
+		// Preserve recognized lines for history in the new profile.
+		// XML serialization of inconsistent lines is handled separately.
+		if r.exportProfile != config.OneCExportProfileTypeInbox {
+			rec.Lines = nil
+		}
 		rec.Missing = append(rec.Missing, "lines")
 	}
 
@@ -174,22 +188,26 @@ func (r *Recognizer) step(ctx context.Context) (bool, error) {
 	// documento с недостающими или отклонёнными полями ломает ему пакет.
 	// Поэтому такой документ не идёт ни в 1С, ни на согласование: он получает
 	// «На проверке», и выгрузка по нему не ставится в очередь.
-	faulty := recognize.RecognitionFaulty(rec)
-	if faulty && !recognize.PartialExportEnabled() {
-		if status == domain.StatusConfirmed || status == domain.StatusNeedsInput {
-			r.log.Info("ошибки распознавания — документ на проверку, XML не формируется",
-				"id", doc.ID, "поля", rec.Faults, "не_найдено", rec.Missing)
+	// Legacy review/approval gates must not block XML in type_inbox.
+	if r.exportProfile != config.OneCExportProfileTypeInbox {
+		faulty := recognize.RecognitionFaulty(rec)
+		if faulty && !recognize.PartialExportEnabled() {
+			if status == domain.StatusConfirmed || status == domain.StatusNeedsInput {
+				r.log.Info("ошибки распознавания — документ на проверку, XML не формируется",
+					"id", doc.ID, "поля", rec.Faults, "не_найдено", rec.Missing)
+			}
+			status = domain.StatusNeedsReview
 		}
-		status = domain.StatusNeedsReview
-	}
 
-	approval := company != nil && company.ApprovalRequired
-	if approval && (status == domain.StatusConfirmed || status == domain.StatusNeedsInput) {
-		if recognize.AutoPassEnabled() && rec.AutoPass && status == domain.StatusConfirmed {
-			r.log.Info("документ прошёл автоматическую проверку, согласование не требуется", "id", doc.ID)
-		} else {
-			status = domain.StatusNeedsApproval
+		approval := company != nil && company.ApprovalRequired
+		if approval && (status == domain.StatusConfirmed || status == domain.StatusNeedsInput) {
+			if recognize.AutoPassEnabled() && rec.AutoPass && status == domain.StatusConfirmed {
+				r.log.Info("документ прошёл автоматическую проверку, согласование не требуется", "id", doc.ID)
+			} else {
+				status = domain.StatusNeedsApproval
+			}
 		}
+
 	}
 
 	// Golden Dataset использует выделенную учётку golden_test, но общую очередь
@@ -199,14 +217,20 @@ func (r *Recognizer) step(ctx context.Context) (bool, error) {
 	owner, ownerErr := r.db.UserByID(ctx, doc.OwnerID)
 	if ownerErr != nil {
 		r.log.Warn("не удалось определить владельца документа", "id", doc.ID, "error", ownerErr)
+		// Fail closed in the new profile: an unknown owner may
+		// belong to the Golden Dataset test account.
+		if r.exportProfile == config.OneCExportProfileTypeInbox {
+			status = domain.StatusNeedsReview
+		}
 	} else if owner.Login == "golden_test" {
 		status = domain.StatusNeedsReview
 		r.log.Info("golden test document: export disabled", "id", doc.ID)
 	}
 
-	// Apply business document type after all recognition and routing checks.
-	originalDocType := rec.DocType
-	rec.DocType = recognize.EffectiveDocType(originalDocType)
+	// Legacy keeps its previous normalization order.
+	if r.exportProfile != config.OneCExportProfileTypeInbox {
+		rec.DocType = recognize.EffectiveDocType(originalDocType)
+	}
 	if originalDocType != rec.DocType {
 		r.log.Info("document type grouped", "id", doc.ID,
 			"source_type", originalDocType, "effective_type", rec.DocType)
@@ -286,6 +310,14 @@ func (d directory) ByName(name string) (string, string, bool) {
 func (r *Recognizer) route(rec domain.Recognition, missing []string) domain.Status {
 	if !r.autoExport {
 		return domain.StatusNeedsReview
+	}
+	if r.exportProfile == config.OneCExportProfileTypeInbox {
+		if _, ok := recognize.TypeInboxDocType(rec.DocType); !ok {
+			return domain.StatusNeedsReview
+		}
+		// Missing fields, mapping and recognition faults do not
+		// prevent the XML creation job in this profile.
+		return domain.StatusConfirmed
 	}
 	if rec.DocType == "" || rec.DocType == recognize.DocTypeUnknown {
 		return domain.StatusNeedsReview

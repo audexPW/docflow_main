@@ -124,7 +124,7 @@ func run(log *slog.Logger) error {
 
 	pipeline := recognize.NewPipeline(cfg, files, log)
 
-	recognizer := worker.NewRecognizer(db, pipeline, notifier, cfg.AutoExport, cfg.OneC.RequireTypeMapping, log)
+	recognizer := worker.NewRecognizer(db, pipeline, notifier, cfg.AutoExport, cfg.OneC.RequireTypeMapping, cfg.OneC.ExportProfile, log)
 	exportWorker := worker.NewExporter(db, exporter, notifier, cfg.OneC.MaxAttempts, log)
 	housekeeper := worker.NewHousekeeper(db, files, cfg.OneC, log)
 	go recognizer.Run(ctx, cfg.RecognizeWorkers)

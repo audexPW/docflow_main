@@ -3,6 +3,7 @@ package worker
 import (
 	"testing"
 
+	"docflow/internal/config"
 	"docflow/internal/domain"
 	"docflow/internal/recognize"
 )
@@ -134,5 +135,57 @@ func TestFaultyRecognitionGoesToReviewNotApproval(t *testing.T) {
 	}
 	if status != domain.StatusNeedsReview {
 		t.Fatalf("ожидался «На проверке», получено %q", status)
+	}
+}
+
+// The five-folder profile exports recognized business types even when
+// fields are missing, confidence is low or 1C mapping is absent.
+func TestTypeInboxRouting(t *testing.T) {
+	cases := []struct {
+		name       string
+		docType    string
+		autoExport bool
+		missing    []string
+		faults     []string
+		want       domain.Status
+	}{
+		{"act incomplete", "act", true,
+			[]string{"number"}, nil, domain.StatusConfirmed},
+		{"waybill faulty", "waybill", true,
+			nil, []string{"invalid total"}, domain.StatusConfirmed},
+		{"contract", "contract", true,
+			nil, nil, domain.StatusConfirmed},
+		{"power of attorney", "power_of_attorney", true,
+			nil, nil, domain.StatusConfirmed},
+		{"upd without mapping", "upd", true,
+			[]string{"unp"}, nil, domain.StatusConfirmed},
+		{"invoice grouped to act", "invoice", true,
+			nil, nil, domain.StatusConfirmed},
+		{"unknown", "unknown", true,
+			nil, nil, domain.StatusNeedsReview},
+		{"unsupported", "some_other_type", true,
+			nil, nil, domain.StatusNeedsReview},
+		{"auto export disabled", "act", false,
+			nil, nil, domain.StatusNeedsReview},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &Recognizer{
+				autoExport:     tc.autoExport,
+				requireMapping: true,
+				exportProfile:  config.OneCExportProfileTypeInbox,
+			}
+			rec := domain.Recognition{
+				DocType: tc.docType,
+				Missing: tc.missing,
+				Faults:  tc.faults,
+			}
+			got := r.route(rec, tc.missing)
+			if got != tc.want {
+				t.Fatalf("route(%q) = %q, want %q",
+					tc.docType, got, tc.want)
+			}
+		})
 	}
 }
