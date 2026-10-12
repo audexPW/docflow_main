@@ -18,6 +18,7 @@ type Exporter struct {
 	log         *slog.Logger
 	maxAttempts int
 	idle        time.Duration
+	typeInbox   bool
 }
 
 func NewExporter(db *storage.DB, exp onec.Exporter, notifier push.Notifier, maxAttempts int, log *slog.Logger) *Exporter {
@@ -25,6 +26,12 @@ func NewExporter(db *storage.DB, exp onec.Exporter, notifier push.Notifier, maxA
 		maxAttempts = 5
 	}
 	return &Exporter{db: db, exporter: exp, notifier: notifier, log: log, maxAttempts: maxAttempts, idle: 3 * time.Second}
+}
+
+// ConfigureTypeInbox selects the existing export worker's
+// typed mode. No additional queue or worker is created.
+func (e *Exporter) ConfigureTypeInbox() {
+	e.typeInbox = true
 }
 
 func (e *Exporter) Run(ctx context.Context, n int) {
@@ -77,7 +84,40 @@ func (e *Exporter) step(ctx context.Context) (bool, error) {
 		return true, rErr
 	}
 
+	// Legacy continues using the original payload builder.
 	payload := onec.BuildPayload(doc, job.Kind)
+
+	if e.typeInbox {
+		owner, ownerErr := e.db.UserByID(ctx, doc.OwnerID)
+		if ownerErr != nil {
+			_, retryErr := e.db.RescheduleExport(
+				ctx, job.ID,
+				"type_inbox owner lookup: "+ownerErr.Error(),
+				backoff(job.Attempts), e.maxAttempts,
+			)
+			return true, retryErr
+		}
+
+		payload, err = prepareTypeInboxPayload(
+			doc, job.Kind, owner,
+		)
+		if err != nil {
+			e.log.Warn(
+				"type inbox export rejected",
+				"document_id", doc.ID,
+				"reason", err,
+			)
+
+			// Permanently reject a prohibited document.
+			// Never generate XML for it.
+			_, rejectErr := e.db.RescheduleExport(
+				ctx, job.ID,
+				"type_inbox: "+err.Error(),
+				0, 1,
+			)
+			return true, rejectErr
+		}
+	}
 	// Реквизиты юрлица: по ним файловая выгрузка выбирает папку обмена, а 1С
 	// понимает, на какую организацию оформлять документ.
 	if doc.CompanyID != nil {

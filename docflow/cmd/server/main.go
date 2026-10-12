@@ -63,6 +63,16 @@ func run(log *slog.Logger) error {
 		return err
 	}
 
+	// Typed folders require the existing file-based export.
+	// REST and disabled modes cannot silently consume these jobs.
+	if cfg.OneC.TypeInboxEnabled() &&
+		cfg.OneC.Mode != "file" &&
+		cfg.OneC.Mode != "enterprisedata" {
+		return fmt.Errorf(
+			"ONEC_EXPORT_PROFILE=type_inbox requires file-based ONEC_MODE",
+		)
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -125,7 +135,13 @@ func run(log *slog.Logger) error {
 	pipeline := recognize.NewPipeline(cfg, files, log)
 
 	recognizer := worker.NewRecognizer(db, pipeline, notifier, cfg.AutoExport, cfg.OneC.RequireTypeMapping, cfg.OneC.ExportProfile, log)
-	exportWorker := worker.NewExporter(db, exporter, notifier, cfg.OneC.MaxAttempts, log)
+	exportWorker := worker.NewExporter(
+		db, exporter, notifier, cfg.OneC.MaxAttempts, log,
+	)
+
+	if cfg.OneC.TypeInboxEnabled() {
+		exportWorker.ConfigureTypeInbox()
+	}
 	housekeeper := worker.NewHousekeeper(db, files, cfg.OneC, log)
 	go recognizer.Run(ctx, cfg.RecognizeWorkers)
 	go exportWorker.Run(ctx, cfg.ExportWorkers)
