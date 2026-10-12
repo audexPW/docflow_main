@@ -15,17 +15,24 @@ import (
 )
 
 type fileExporter struct {
-	dir string
+	dir           string
+	exportProfile string
 }
 
 func newFileExporter(cfg config.OneCConfig) (*fileExporter, error) {
 	if err := os.MkdirAll(cfg.FileDir, 0o750); err != nil {
 		return nil, err
 	}
-	return &fileExporter{dir: cfg.FileDir}, nil
+	return &fileExporter{
+		dir:           cfg.FileDir,
+		exportProfile: cfg.ExportProfile,
+	}, nil
 }
 
 func (e *fileExporter) Export(_ context.Context, p Payload) error {
+	if e.exportProfile == config.OneCExportProfileTypeInbox {
+		return e.exportTypeInbox(p)
+	}
 	doc := toEnterpriseData(p)
 	body, err := xml.MarshalIndent(doc, "", "  ")
 	if err != nil {
