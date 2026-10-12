@@ -20,6 +20,7 @@ type Payload struct {
 	Kind       string   `json:"kind"`
 	Incomplete bool     `json:"incomplete"`
 	Missing    []string `json:"missing,omitempty"`
+	TypeInbox  bool     `json:"-"`
 	// Populated only by BuildTypeInboxPayload.
 	Faults            []string                 `json:"faults,omitempty"`
 	Rejected          map[string]string        `json:"rejected,omitempty"`

@@ -88,26 +88,26 @@ type edBody struct {
 }
 
 type edDocument struct {
-	SourceID     string    `xml:"SourceId"`
-	Kind         string    `xml:"kind,attr,omitempty"`
-	Incomplete   bool      `xml:"incomplete,attr,omitempty"`
-	Type         string    `xml:"Type"`
-	TypeTitle    string    `xml:"TypeTitle,omitempty"`
-	Target       *edTarget `xml:"Target,omitempty"`
-	Number       string    `xml:"Number"`
-	Date         string    `xml:"Date"`
-	Total        string    `xml:"Total"`
-	VATAmount    string    `xml:"VATAmount"`
-	Currency     string    `xml:"Currency"`
+	SourceID   string    `xml:"SourceId"`
+	Kind       string    `xml:"kind,attr,omitempty"`
+	Incomplete bool      `xml:"incomplete,attr,omitempty"`
+	Type       string    `xml:"Type"`
+	TypeTitle  string    `xml:"TypeTitle,omitempty"`
+	Target     *edTarget `xml:"Target,omitempty"`
+	Number     string    `xml:"Number"`
+	Date       string    `xml:"Date"`
+	Total      string    `xml:"Total"`
+	VATAmount  string    `xml:"VATAmount"`
+	Currency   string    `xml:"Currency"`
 	// AmountNoVAT и Contract* объявлены обязательными в doctypes.json, значит
 	// должны быть явными тегами, а не теряться в AdditionalFields. Договор —
 	// второе субконто счетов 60.1.x в конфигурации заказчика.
 	AmountNoVAT    string `xml:"AmountNoVAT"`
 	ContractNumber string `xml:"ContractNumber"`
 	ContractDate   string `xml:"ContractDate"`
-	Organization string    `xml:"Organization"`
-	OrgTaxID     string    `xml:"OrganizationUNP"`
-	FileName     string    `xml:"FileName,omitempty"`
+	Organization   string `xml:"Organization"`
+	OrgTaxID       string `xml:"OrganizationUNP"`
+	FileName       string `xml:"FileName,omitempty"`
 	// Accounting — готовая проводка: счета подобраны по содержимому документа
 	// и плану счетов заказчика. Пустые значения означают «не определено» —
 	// приёмник в этом случае оставляет выбор бухгалтеру, как и раньше.
@@ -117,10 +117,11 @@ type edDocument struct {
 	// Table — табличная часть со структурой: колонки и ячейки. Lines оставлены
 	// для совместимости с уже написанным приёмником, но разбирать теперь
 	// правильнее Table: там видно, какая ячейка какой колонке принадлежит.
-	Table   *edTable  `xml:"Table,omitempty"`
-	Lines   []edLine  `xml:"Lines>Line"`
-	Missing []string  `xml:"MissingFields>Field,omitempty"`
-	Extra   []edField `xml:"AdditionalFields>Field"`
+	Table   *edTable            `xml:"Table,omitempty"`
+	Lines   []edLine            `xml:"Lines>Line"`
+	Missing []string            `xml:"MissingFields>Field,omitempty"`
+	Quality *edTypeInboxQuality `xml:"RecognitionQuality,omitempty"`
+	Extra   []edField           `xml:"AdditionalFields>Field"`
 }
 
 // edAccounting — счета учёта документа целиком. По строкам счёт может
@@ -196,7 +197,7 @@ type edLine struct {
 	// AmountNoVAT — сумма строки без налога, как она напечатана в бланке.
 	// Приёмник берёт её как есть, вместо того чтобы вычитать НДС из итога.
 	AmountNoVAT string `xml:"AmountNoVAT,omitempty"`
-	VAT     string `xml:"VAT,omitempty"`
+	VAT         string `xml:"VAT,omitempty"`
 }
 
 type edField struct {
@@ -294,25 +295,25 @@ func toEnterpriseData(p Payload) enterpriseData {
 		Format: "EnterpriseData/1.0",
 		Body: edBody{
 			Document: edDocument{
-				SourceID:     p.DocumentID,
-				Kind:         p.Kind,
-				Incomplete:   p.Incomplete,
-				Type:         p.DocType,
-				TypeTitle:    p.DocTypeTitle,
-				Target:       buildTarget(p),
-				Number:       p.Number,
-				Date:         p.Date,
-				Total:        p.Total,
-				VATAmount:    p.VATAmount,
-				Currency:     p.Currency,
+				SourceID:       p.DocumentID,
+				Kind:           p.Kind,
+				Incomplete:     p.Incomplete,
+				Type:           p.DocType,
+				TypeTitle:      p.DocTypeTitle,
+				Target:         buildTarget(p),
+				Number:         p.Number,
+				Date:           p.Date,
+				Total:          p.Total,
+				VATAmount:      p.VATAmount,
+				Currency:       p.Currency,
 				AmountNoVAT:    p.AmountNoVAT,
 				ContractNumber: p.ContractNumber,
 				ContractDate:   p.ContractDate,
-				Organization: p.Organization,
-				OrgTaxID:     p.OrgTaxID,
-				FileName:     p.FileName,
-				Accounting:   buildAccounting(p),
-				Company:      buildCompany(p),
+				Organization:   p.Organization,
+				OrgTaxID:       p.OrgTaxID,
+				FileName:       p.FileName,
+				Accounting:     buildAccounting(p),
+				Company:        buildCompany(p),
 				Counterparty: edCounter{
 					Name: p.Counterpty,
 					UNP:  p.UNP,
@@ -322,6 +323,7 @@ func toEnterpriseData(p Payload) enterpriseData {
 				Table:   buildTable(p.Table),
 				Lines:   lines,
 				Missing: p.Missing,
+				Quality: buildTypeInboxQuality(p),
 				Extra:   extra,
 			},
 		},

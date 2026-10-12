@@ -38,6 +38,7 @@ func BuildTypeInboxPayload(
 	}
 
 	p := BuildPayload(doc, kind)
+	p.TypeInbox = true
 	p.DocType = docType
 	p.DocTypeTitle = recognize.DocTypeTitle(docType)
 	if docType == "act" {
