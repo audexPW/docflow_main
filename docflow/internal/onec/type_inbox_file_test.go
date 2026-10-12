@@ -79,11 +79,11 @@ func TestTypeInboxWritesFiveFolders(t *testing.T) {
 			) {
 				t.Fatal("incorrect XML document type")
 			}
-			if !strings.Contains(
+			if strings.Contains(
 				string(content),
 				"<RecognitionQuality",
 			) {
-				t.Fatal("missing quality diagnostics")
+				t.Fatal("unexpected XML diagnostics")
 			}
 
 			entries, err := os.ReadDir(

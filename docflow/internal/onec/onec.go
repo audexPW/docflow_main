@@ -16,38 +16,29 @@ import (
 // пришёл не полностью и часть полей будет дослана. DocumentID стабилен между
 // частичной выгрузкой и досылкой — 1С сопоставляет их по нему (upsert).
 type Payload struct {
-	DocumentID string   `json:"document_id"`
-	Kind       string   `json:"kind"`
-	Incomplete bool     `json:"incomplete"`
-	Missing    []string `json:"missing,omitempty"`
-	TypeInbox  bool     `json:"-"`
-	// Populated only by BuildTypeInboxPayload.
-	Faults            []string                 `json:"faults,omitempty"`
-	Rejected          map[string]string        `json:"rejected,omitempty"`
-	Review            []string                 `json:"review,omitempty"`
-	ReviewNotes       map[string]string        `json:"review_notes,omitempty"`
-	DocTypeConfidence float64                  `json:"doc_type_confidence,omitempty"`
-	FieldEvidence     map[string]FieldEvidence `json:"field_evidence,omitempty"`
-	IntegrationIssues []string                 `json:"integration_issues,omitempty"`
-
-	DocType        string `json:"doc_type"`
-	DocTypeTitle   string `json:"doc_type_title,omitempty"`   // подпись типа для человека
-	OneCObject     string `json:"onec_object,omitempty"`      // объект метаданных 1С, куда класть документ
-	OneCKind       string `json:"onec_object_kind,omitempty"` // document | catalog | file
-	Number         string `json:"number,omitempty"`
-	Date           string `json:"date,omitempty"`
-	Total          string `json:"total,omitempty"`
-	VATAmount      string `json:"vat_amount,omitempty"` // сумма НДС по документу
-	Currency       string `json:"currency,omitempty"`
-	AmountNoVAT    string `json:"amount_no_vat,omitempty"`
-	ContractNumber string `json:"contract_number,omitempty"`
-	ContractDate   string `json:"contract_date,omitempty"`
-	UNP            string `json:"unp,omitempty"` // Беларусь: учётный номер плательщика
-	INN            string `json:"inn,omitempty"` // Россия
-	KPP            string `json:"kpp,omitempty"`
-	Counterpty     string `json:"counterparty,omitempty"`
-	Organization   string `json:"organization,omitempty"`     // своя фирма заказчика
-	OrgTaxID       string `json:"organization_unp,omitempty"` // её УНП/ИНН — ключ поиска организации
+	TypeInbox      bool     `json:"-"`
+	DocumentID     string   `json:"document_id"`
+	Kind           string   `json:"kind"`
+	Incomplete     bool     `json:"incomplete"`
+	Missing        []string `json:"missing,omitempty"`
+	DocType        string   `json:"doc_type"`
+	DocTypeTitle   string   `json:"doc_type_title,omitempty"`   // подпись типа для человека
+	OneCObject     string   `json:"onec_object,omitempty"`      // объект метаданных 1С, куда класть документ
+	OneCKind       string   `json:"onec_object_kind,omitempty"` // document | catalog | file
+	Number         string   `json:"number,omitempty"`
+	Date           string   `json:"date,omitempty"`
+	Total          string   `json:"total,omitempty"`
+	VATAmount      string   `json:"vat_amount,omitempty"` // сумма НДС по документу
+	Currency       string   `json:"currency,omitempty"`
+	AmountNoVAT    string   `json:"amount_no_vat,omitempty"`
+	ContractNumber string   `json:"contract_number,omitempty"`
+	ContractDate   string   `json:"contract_date,omitempty"`
+	UNP            string   `json:"unp,omitempty"` // Беларусь: учётный номер плательщика
+	INN            string   `json:"inn,omitempty"` // Россия
+	KPP            string   `json:"kpp,omitempty"`
+	Counterpty     string   `json:"counterparty,omitempty"`
+	Organization   string   `json:"organization,omitempty"`     // своя фирма заказчика
+	OrgTaxID       string   `json:"organization_unp,omitempty"` // её УНП/ИНН — ключ поиска организации
 
 	// Компания (юрлицо), к которой относится документ: её папка обмена и
 	// реквизиты. 1С по ним понимает, в какую базу/организацию класть документ,

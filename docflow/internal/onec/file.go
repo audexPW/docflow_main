@@ -124,11 +124,10 @@ type edDocument struct {
 	// Table — табличная часть со структурой: колонки и ячейки. Lines оставлены
 	// для совместимости с уже написанным приёмником, но разбирать теперь
 	// правильнее Table: там видно, какая ячейка какой колонке принадлежит.
-	Table   *edTable            `xml:"Table,omitempty"`
-	Lines   []edLine            `xml:"Lines>Line"`
-	Missing []string            `xml:"MissingFields>Field,omitempty"`
-	Quality *edTypeInboxQuality `xml:"RecognitionQuality,omitempty"`
-	Extra   []edField           `xml:"AdditionalFields>Field"`
+	Table   *edTable  `xml:"Table,omitempty"`
+	Lines   []edLine  `xml:"Lines>Line"`
+	Missing []string  `xml:"MissingFields>Field,omitempty"`
+	Extra   []edField `xml:"AdditionalFields>Field"`
 }
 
 // edAccounting — счета учёта документа целиком. По строкам счёт может
@@ -330,7 +329,6 @@ func toEnterpriseData(p Payload) enterpriseData {
 				Table:   buildTable(p.Table),
 				Lines:   lines,
 				Missing: p.Missing,
-				Quality: buildTypeInboxQuality(p),
 				Extra:   extra,
 			},
 		},

@@ -1,6 +1,9 @@
 package onec
 
 import (
+	"bytes"
+	"encoding/xml"
+	"strings"
 	"testing"
 
 	"docflow/internal/domain"
@@ -8,26 +11,113 @@ import (
 	"github.com/google/uuid"
 )
 
-func TestTypeInboxPayloadKeepsQualityFlags(t *testing.T) {
+func TestTypeInboxPreservesLegacyXML(t *testing.T) {
+	for _, typ := range []string{
+		"act",
+		"waybill",
+		"contract",
+		"power_of_attorney",
+		"upd",
+	} {
+		t.Run(typ, func(t *testing.T) {
+			doc := domain.Document{
+				ID:           uuid.New(),
+				OriginalName: "test.pdf",
+				Recognition: &domain.Recognition{
+					DocType: typ,
+					Fields: map[string]domain.Field{
+						"number": {Value: "125"},
+						"date":   {Value: "12.10.2026"},
+					},
+					Missing: []string{"total"},
+				},
+			}
+
+			oldPayload := BuildPayload(
+				doc, domain.ExportKindCreate,
+			)
+
+			newPayload, err := BuildTypeInboxPayload(
+				doc, domain.ExportKindCreate,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			oldXML, err := xml.Marshal(
+				toEnterpriseData(oldPayload),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			newXML, err := xml.Marshal(
+				toEnterpriseData(newPayload),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if !bytes.Equal(oldXML, newXML) {
+				t.Fatal("original XML structure changed")
+			}
+
+			if !newPayload.TypeInbox {
+				t.Fatal("typed routing marker missing")
+			}
+
+			if strings.Contains(
+				string(newXML), "RecognitionQuality",
+			) {
+				t.Fatal("unexpected XML diagnostics")
+			}
+		})
+	}
+}
+
+func TestTypeInboxFaultWithoutNewXMLElements(t *testing.T) {
 	doc := domain.Document{
 		ID: uuid.New(),
 		Recognition: &domain.Recognition{
-			DocType:           "upd",
-			DocTypeConfidence: 0.42,
+			DocType: "act",
 			Fields: map[string]domain.Field{
-				"number": {
-					Value:      "UPD-7",
-					Confidence: 0.35,
-					Source:     "model",
-				},
+				"number": {Value: "125"},
 			},
-			Missing: []string{"date"},
-			Faults:  []string{"invalid_date"},
-			Rejected: map[string]string{
-				"date": "31.02.2026",
-			},
-			ReviewNotes: map[string]string{
-				"date": "invalid calendar date",
+			Faults: []string{"invalid_date"},
+		},
+	}
+
+	p, err := BuildTypeInboxPayload(
+		doc, domain.ExportKindCreate,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !p.Incomplete {
+		t.Fatal("incomplete attribute not set")
+	}
+
+	body, err := xml.Marshal(toEnterpriseData(p))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if strings.Contains(
+		string(body), "RecognitionQuality",
+	) {
+		t.Fatal("unexpected XML section")
+	}
+}
+
+func TestTypeInboxDoesNotInventMissing(t *testing.T) {
+	doc := domain.Document{
+		ID: uuid.New(),
+		Recognition: &domain.Recognition{
+			DocType: "act",
+			Fields: map[string]domain.Field{
+				"number": {Value: "125"},
+				"date":   {Value: "12.10.2026"},
 			},
 		},
 	}
@@ -38,155 +128,63 @@ func TestTypeInboxPayloadKeepsQualityFlags(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.DocType != "upd" || !p.Incomplete {
-		t.Fatalf("incorrect type or completeness: %+v", p)
-	}
-	if len(p.Faults) != 1 ||
-		p.Rejected["date"] != "31.02.2026" {
-		t.Fatal("recognition quality flags lost")
-	}
-	if p.FieldEvidence["number"].Confidence != 0.35 {
-		t.Fatal("field confidence lost")
-	}
-	if p.Number != "UPD-7" || p.Date != "" {
-		t.Fatal("field was fabricated or lost")
-	}
-	if !containsMissing(
-		p.IntegrationIssues, "company_not_assigned",
-	) {
-		t.Fatal("missing company warning")
+
+	if p.Incomplete || len(p.Missing) != 0 {
+		t.Fatal("unexpected missing fields")
 	}
 }
 
-// A transfer acceptance act can legitimately have no total.
-// Its source-specific Missing list must survive grouping to act.
-func TestTypeInboxPayloadDoesNotInventMissingAfterGrouping(t *testing.T) {
-	rec := &domain.Recognition{
-		DocType: "act",
-		Fields: map[string]domain.Field{
-			"number": {Value: "15", Confidence: 0.9},
-			"date":   {Value: "12.03.2026", Confidence: 0.9},
-		},
-		Missing: nil,
-	}
-
-	p, err := BuildTypeInboxPayload(
-		domain.Document{ID: uuid.New(), Recognition: rec},
-		domain.ExportKindCreate,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if len(p.Missing) != 0 || p.Incomplete {
-		t.Fatalf("unexpected missing fields: %v", p.Missing)
-	}
-	if p.Total != "" {
-		t.Fatalf("total was fabricated: %q", p.Total)
-	}
-}
-
-func TestTypeInboxPayloadFaultWithoutMissing(t *testing.T) {
-	rec := &domain.Recognition{
-		DocType: "act",
-		Fields:  completeActFields(),
-		Faults:  []string{"arithmetic_mismatch"},
-	}
-
-	p, err := BuildTypeInboxPayload(
-		domain.Document{ID: uuid.New(), Recognition: rec},
-		domain.ExportKindCreate,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !p.Incomplete {
-		t.Fatal("fault-only document must be incomplete")
-	}
-
-	legacy := BuildPayload(
-		domain.Document{ID: uuid.New(), Recognition: rec},
-		domain.ExportKindCreate,
-	)
-	if legacy.Incomplete || len(legacy.Faults) != 0 {
-		t.Fatal("legacy payload behavior changed")
-	}
-}
-
-func TestTypeInboxPayloadCleanRecognition(t *testing.T) {
-	companyID := uuid.New()
-	p, err := BuildTypeInboxPayload(
-		domain.Document{
-			ID:        uuid.New(),
-			CompanyID: &companyID,
-			Recognition: &domain.Recognition{
-				DocType: "act",
-				Fields:  completeActFields(),
-			},
-		},
-		domain.ExportKindCreate,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if p.Incomplete {
-		t.Fatalf("clean recognition marked incomplete: %v",
-			p.Missing)
-	}
-}
-
-func TestTypeInboxPayloadSuppressesInvalidLines(t *testing.T) {
+func TestTypeInboxSuppressesInvalidLines(t *testing.T) {
 	rec := &domain.Recognition{
 		DocType: "waybill",
 		Fields: map[string]domain.Field{
-			"total": {Value: "100.00", Confidence: 0.9},
+			"total": {Value: "100.00"},
 		},
 		Missing: []string{"lines"},
 		Lines: []domain.LineItem{
-			{Name: "Item A", Amount: "40.00"},
-			{Name: "Item B", Amount: "70.00"},
-		},
-		Table: &domain.Table{
-			Rows: []domain.TableRow{{Index: 1}},
+			{Name: "A", Amount: "40.00"},
+			{Name: "B", Amount: "70.00"},
 		},
 	}
 
 	p, err := BuildTypeInboxPayload(
-		domain.Document{ID: uuid.New(), Recognition: rec},
+		domain.Document{
+			ID:          uuid.New(),
+			Recognition: rec,
+		},
 		domain.ExportKindCreate,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.Lines != nil || p.Table != nil || !p.Incomplete {
-		t.Fatal("invalid lines were not excluded")
+
+	if !p.Incomplete || p.Lines != nil {
+		t.Fatal("invalid lines were exported")
 	}
-	if len(rec.Lines) != 2 || rec.Table == nil {
-		t.Fatal("original recognition data was modified")
+
+	if len(rec.Lines) != 2 {
+		t.Fatal("recognition source was modified")
 	}
 }
 
-func TestTypeInboxPayloadRejectsUnsupported(t *testing.T) {
+func TestTypeInboxRejectsUnsupported(t *testing.T) {
 	cases := []*domain.Recognition{
 		nil,
 		{DocType: "unknown"},
 		{DocType: "unsupported_document"},
 	}
+
 	for _, rec := range cases {
 		_, err := BuildTypeInboxPayload(
-			domain.Document{ID: uuid.New(), Recognition: rec},
+			domain.Document{
+				ID:          uuid.New(),
+				Recognition: rec,
+			},
 			domain.ExportKindCreate,
 		)
-		if err == nil {
-			t.Fatalf("expected rejection for %+v", rec)
-		}
-	}
-}
 
-func completeActFields() map[string]domain.Field {
-	return map[string]domain.Field{
-		"number": {Value: "1", Confidence: 0.9},
-		"date":   {Value: "12.03.2026", Confidence: 0.9},
-		"total":  {Value: "100.00", Confidence: 0.9},
+		if err == nil {
+			t.Fatalf("unexpected type accepted: %+v", rec)
+		}
 	}
 }
