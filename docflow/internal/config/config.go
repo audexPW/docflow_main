@@ -96,11 +96,18 @@ type LLMConfig struct {
 	Temperature float64
 }
 
+const (
+	OneCExportProfileLegacy    = "legacy"
+	OneCExportProfileTypeInbox = "type_inbox"
+)
+
 type OneCConfig struct {
-	Mode       string // rest | enterprisedata | file | disabled
-	RESTURL    string
-	AuthHeader string
-	FileDir    string
+	// ExportProfile selects the document export policy.
+	ExportProfile string
+	Mode          string // rest | enterprisedata | file | disabled
+	RESTURL       string
+	AuthHeader    string
+	FileDir       string
 	// RequireTypeMapping — отправлять в 1С только те типы, для которых в
 	// реестре задан объект-приёмник. Остальное уходит оператору.
 	RequireTypeMapping bool
@@ -122,6 +129,11 @@ type OneCConfig struct {
 	// ArchiveKeepDays — сколько дней архивный документ хранится, прежде чем
 	// быть удалённым вместе с файлом и своей выгрузкой. 0 — не удалять.
 	ArchiveKeepDays int
+}
+
+// TypeInboxEnabled reports whether the new export policy is selected.
+func (c OneCConfig) TypeInboxEnabled() bool {
+	return c.ExportProfile == OneCExportProfileTypeInbox
 }
 
 // ArchivesOn отвечает, закрывает ли этот статус из 1С работу над документом.
@@ -188,7 +200,10 @@ func Load() (Config, error) {
 	}
 
 	c.OneC = OneCConfig{
-		Mode:               env("ONEC_MODE", "file"),
+		Mode: env("ONEC_MODE", "file"),
+		ExportProfile: strings.ToLower(strings.TrimSpace(
+			env("ONEC_EXPORT_PROFILE", OneCExportProfileLegacy),
+		)),
 		RESTURL:            env("ONEC_REST_URL", ""),
 		AuthHeader:         env("ONEC_AUTH_HEADER", ""),
 		FileDir:            env("ONEC_FILE_DIR", "./data/onec_outbox"),
@@ -202,6 +217,14 @@ func Load() (Config, error) {
 		AckTimeout:      durEnv("ONEC_ACK_TIMEOUT", 48*time.Hour),
 		ArchiveStatuses: splitEnv("ONEC_ARCHIVE_STATUSES", "posted"),
 		ArchiveKeepDays: intEnv("ARCHIVE_KEEP_DAYS", 21),
+	}
+
+	if c.OneC.ExportProfile != OneCExportProfileLegacy &&
+		c.OneC.ExportProfile != OneCExportProfileTypeInbox {
+		return c, fmt.Errorf(
+			"ONEC_EXPORT_PROFILE: unsupported value %q",
+			c.OneC.ExportProfile,
+		)
 	}
 
 	c.AutoExport = boolEnv("AUTO_EXPORT_ENABLED", true)
