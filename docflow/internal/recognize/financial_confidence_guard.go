@@ -2,6 +2,7 @@ package recognize
 
 import (
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -45,10 +46,39 @@ func financialPositiveVATInTable(rec *domain.Recognition) bool {
 	return false
 }
 
+// financialPositiveVATInOCR searches for an explicitly stated nonzero VAT
+// amount. A tax rate (e.g. 20%) and bare numbers elsewhere are not evidence.
+// Deliberately require a colon or equals sign after the amount label to
+// avoid interpreting table headers and adjacent position amounts as a total.
+var financialPositiveVATAmountRE = regexp.MustCompile(
+	`(?i)(?:сумма\s+ндс|в\s+т\.?\s*ч\.?\s+ндс|в\s+том\s+числе\s+ндс)\s*[:=]\s*([0-9]+(?:[ \x{00a0}\x{202f}][0-9]{3})*(?:[.,][0-9]{1,2})?)`,
+)
+
+func financialPositiveVATInOCR(text string) bool {
+	for _, match := range financialPositiveVATAmountRE.FindAllStringSubmatchIndex(text, -1) {
+		end := match[3]
+		// Reject percentages, partial decimals and truncated numbers.
+		if end < len(text) && text[end] >= '0' && text[end] <= '9' {
+			continue
+		}
+		if end+1 < len(text) && (text[end] == ',' || text[end] == '.') && text[end+1] >= '0' && text[end+1] <= '9' {
+			continue
+		}
+		if strings.HasPrefix(strings.TrimSpace(text[end:]), "%") {
+			continue
+		}
+		amount := strings.ReplaceAll(text[match[2]:end], "\u202f", "")
+		if cents, ok := groundedMoneyCents(amount); ok && cents > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // financialExplicitNoVAT is intentionally conservative. A lone numerical
 // zero anywhere in OCR does NOT confirm the document's overall VAT is zero.
 func financialExplicitNoVAT(rec *domain.Recognition, ocrText string) bool {
-	if financialPositiveVATInTable(rec) {
+	if financialPositiveVATInTable(rec) || financialPositiveVATInOCR(ocrText) {
 		return false
 	}
 	if spoken, ok := groundedMoneyCents(VATFromWords(ocrText)); ok {
