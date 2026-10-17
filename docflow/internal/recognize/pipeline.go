@@ -364,6 +364,12 @@ func (p *Pipeline) analyzePage(ctx context.Context, page pageText, tr *Tracer, h
 		rec.Missing = append(rec.Missing, "lines")
 	}
 	DecideAutoPass(&rec, hint)
+	// Optional safety gate; off by default until Golden91 and external QA pass.
+	if envBool("FINANCIAL_CONFIDENCE_GUARD_ENABLED", false) {
+		if ApplyFinancialConfidenceGuard(&rec, ocrText) {
+			tr.Set("financial_confidence_guard_flagged", true)
+		}
+	}
 	tr.Set("отклонено_проверкой_формата", rec.Rejected)
 	tr.Set("проверки", rec.Checks)
 	tr.Set("авто_проход", rec.AutoPass)
