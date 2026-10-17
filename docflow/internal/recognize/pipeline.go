@@ -325,6 +325,12 @@ func (p *Pipeline) analyzePage(ctx context.Context, page pageText, tr *Tracer, h
 	FillTotalsFromTable(&rec)
 	// Сумма без НДС: из итога таблицы или из текста «в том числе НДС».
 	FillAmounts(&rec, ocrText)
+	// Conservative feature flag: off by default until independent regression testing.
+	if envBool("FINANCIAL_TABLE_RECONCILE_ENABLED", false) {
+		if ReconcileGroundedSingleLineAmounts(&rec, ocrText) {
+			tr.Set("single_line_financial_table_repaired", true)
+		}
+	}
 	// Стороны — по известному УНП компании, контрагент — по справочнику.
 	ResolveParties(&rec, ocrText, hint)
 
