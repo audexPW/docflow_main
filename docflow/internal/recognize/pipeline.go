@@ -325,7 +325,19 @@ func (p *Pipeline) analyzePage(ctx context.Context, page pageText, tr *Tracer, h
 	FillTotalsFromTable(&rec)
 	// Сумма без НДС: из итога таблицы или из текста «в том числе НДС».
 	FillAmounts(&rec, ocrText)
+	// Conservative feature flag: off by default until independent regression testing.
+	if envBool("FINANCIAL_TABLE_RECONCILE_ENABLED", false) {
+		if ReconcileGroundedSingleLineAmounts(&rec, ocrText) {
+			tr.Set("single_line_financial_table_repaired", true)
+		}
+	}
 	// Стороны — по известному УНП компании, контрагент — по справочнику.
+	// Experimental, strictly evidence-based financial recovery. Disabled by default.
+	if envBool("FINANCIAL_EVIDENCE_RECOVERY_ENABLED", false) {
+		if RecoverFinancialTotalsFromEvidence(&rec, ocrText) {
+			tr.Set("financial_evidence_recovery_applied", true)
+		}
+	}
 	ResolveParties(&rec, ocrText, hint)
 
 	// Счета учёта подбираем последним шагом — по уже собранным строкам и типу
@@ -358,6 +370,12 @@ func (p *Pipeline) analyzePage(ctx context.Context, page pageText, tr *Tracer, h
 		rec.Missing = append(rec.Missing, "lines")
 	}
 	DecideAutoPass(&rec, hint)
+	// Optional safety gate; off by default until Golden91 and external QA pass.
+	if envBool("FINANCIAL_CONFIDENCE_GUARD_ENABLED", false) {
+		if ApplyFinancialConfidenceGuard(&rec, ocrText) {
+			tr.Set("financial_confidence_guard_flagged", true)
+		}
+	}
 	tr.Set("отклонено_проверкой_формата", rec.Rejected)
 	tr.Set("проверки", rec.Checks)
 	tr.Set("авто_проход", rec.AutoPass)
