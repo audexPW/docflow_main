@@ -332,6 +332,12 @@ func (p *Pipeline) analyzePage(ctx context.Context, page pageText, tr *Tracer, h
 		}
 	}
 	// Стороны — по известному УНП компании, контрагент — по справочнику.
+	// Experimental, strictly evidence-based financial recovery. Disabled by default.
+	if envBool("FINANCIAL_EVIDENCE_RECOVERY_ENABLED", false) {
+		if RecoverFinancialTotalsFromEvidence(&rec, ocrText) {
+			tr.Set("financial_evidence_recovery_applied", true)
+		}
+	}
 	ResolveParties(&rec, ocrText, hint)
 
 	// Счета учёта подбираем последним шагом — по уже собранным строкам и типу
